@@ -181,8 +181,8 @@ def _collect_yolo_court_keypoints(video_path: str,
 
         frame_idx +=1
 
-        if frame_idx < 200: # Allow 200 frames to account for camera initial jitter
-            continue
+        # if frame_idx < 200: # Allow 200 frames to account for camera initial jitter
+        #     continue
 
         # YOLO inference on this frame
         results = model(frame, conf=conf, verbose=False)
@@ -375,7 +375,7 @@ def load_or_calibrate(
         playable = _mask_from_polygon((H, W), poly)
         top_line, bot_line = _poly_baselines(poly)
 
-        extended = extend_far_side(playable.copy(), top_base=top_line, bot_base=bot_line, extend_px=100)
+        extended = extend_far_side(playable.copy(), top_base=top_line, bot_base=bot_line, extend_px=extend_px)
         extended = _dilate(extended.copy(), extend_px) if extend_px > 0 else extended.copy()
 
         if mask_playable_out:
