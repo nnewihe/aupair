@@ -220,9 +220,17 @@ class ServePhysics:
         cy_for_ready = p.sm_cy_ft if p.sm_cy_ft is not None else cy_ft
         in_band = (self.ready_min_ft <= cy_for_ready <= self.ready_max_ft)
 
-        # Lateral distance from left singles sideline in ft
-        dist_left_px = point_line_distance_px(P, self.TL, self.BL)
-        cx_ft = dist_left_px / max(ppf, 1e-6)
+        # -----------------------------
+        # [CHANGED] Lateral drift from the CENTER of the bbox (more stable)
+        # -----------------------------
+        cy_center = 0.5 * (y1 + y2)
+        P_lat = (cx, cy_center)
+
+        # Use ppf at the same y as the lateral point (avoid scale jitter)
+        ppf_lat = float(self.poly(cy_center))
+
+        dist_left_px = point_line_distance_px(P_lat, self.TL, self.BL)
+        cx_ft = dist_left_px / max(ppf_lat, 1e-6)
 
         # Anti-flicker grace
         if in_band:
