@@ -35,7 +35,7 @@ except ImportError:
 # =====================================================
 use_yolo = True
 
-match_path ="data/matches/2025-12-07/"
+match_path ="data/matches/2025-10-06-clean/"
 video_path = match_path + "raw_video.mp4"
 
 # Trophy classifier
