@@ -91,7 +91,7 @@ class ServePhysics:
         # Ready-band parameters
         # -------------------------------
         # cy_ft < 0 means "behind baseline", cy_ft > 0 means inside court
-        self.ready_min_ft = -1.0
+        self.ready_min_ft = 0.5
         self.ready_max_ft = 3.0
 
         # Must be ready for at least this long before we allow a serve event
