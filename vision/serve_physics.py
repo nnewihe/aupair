@@ -144,11 +144,11 @@ class ServePhysics:
         # -------------------------------
         # [CHANGED] We allow either order: trophy can occur before toss or after toss.
         # This is the maximum allowed separation (seconds) between toss onset and trophy.
-        self.toss_to_trophy_max_s = 1.5  # [CHANGED]
+        self.toss_to_trophy_max_s = 0.6  # [CHANGED]
 
         # If you want trophy to be optional “verification”, keep this False.
         # If True, we require trophy evidence near the toss to trigger serve.
-        self.require_trophy = False
+        self.require_trophy = True
 
         # Internal states
         self.player_state: Optional[PlayerPhysicsState] = None

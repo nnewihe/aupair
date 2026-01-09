@@ -112,12 +112,12 @@ def toss_roi_from_player_box(frame_shape, player_box):
     bh = y2 - y1
 
     # Horizontal: expand beyond shoulders
-    rx1 = int(x1 - 0.6 * bw)
-    rx2 = int(x2 + 0.6 * bw)
+    rx1 = int(x1 - 0.25 * bw)
+    rx2 = int(x2 + 0.25 * bw)
 
-    # Vertical: from above head down to upper chest
-    ry1 = int(y1 - 0.9 * bh)
-    ry2 = int(y1 + 0.45 * bh)
+    # Vertical: from above head only
+    ry1 = int(y1 - 1.0 * bh)
+    ry2 = int(y1 + 0.2 * bh)
 
     rx1 = max(0, min(W - 1, rx1))
     rx2 = max(0, min(W - 1, rx2))
@@ -565,14 +565,24 @@ def detect_serve_event_times(
 # CLI demo entrypoint (optional)
 # =====================================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Detect serves in a video.")
+    parser.add_argument("input_video", help="Path to the input video file.")
+    parser.add_argument("--points_csv", help="Path to the points CSV file.", default="")
+    parser.add_argument("--near_side_start", action="store_true", help="Flag to indicate the serve is from the near side.")
+    parser.add_argument("--show_ui", action="store_true", help="Flag to show the UI.")
+
+    args = parser.parse_args()
+
     # Example usage (edit paths as needed)
     serve_times = detect_serve_event_times(
-        input_video="data/matches/2025-10-06-clean/raw_video.mp4",
-        points_csv="data/matches/2025-10-06-clean/points.csv",
-        near_side_start=True,
+        input_video=args.input_video,
+        points_csv=args.points_csv,
+        near_side_start=args.near_side_start,
         write_telemetry_csv=True,
         telemetry_csv_path="serve_log.csv",
-        show_ui=True,
+        show_ui=args.show_ui,
     )
     print("\nServe start times (s):")
     print(serve_times)

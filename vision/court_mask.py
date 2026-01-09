@@ -367,8 +367,8 @@ def load_or_calibrate(
     H, W = frame.shape[:2]
 
     # 1) Load existing polygon if present
-    if os.path.exists(poly_json_path):
-        with open(poly_json_path, "r") as f:
+    if os.path.exists(poly_json_path) and os.path.getsize(poly_json_path) > 0:
+        with open(poly_json_path, "r", encoding="latin-1") as f:
             data = json.load(f)
         poly = np.array(data, dtype=np.float32).reshape(-1, 2)
 
