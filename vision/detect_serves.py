@@ -19,8 +19,17 @@ import cv2
 import pathlib
 import sys
 import numpy as np
+import math
 import csv
-from typing import List, Optional, Tuple
+import random
+from typing import List, Optional, Tuple, Dict, Any
+
+from dataclasses import dataclass
+from filterpy.kalman import KalmanFilter
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
+
+
 
 try:
     from src.vision.court_mask import find_court_mask
@@ -46,10 +55,70 @@ DEFAULT_DEBUG_PRINT_INTERVAL = 0.5
 DEFAULT_BALL_CONF_MIN = 0.10
 DEFAULT_DRAW_TOSS_ROI = True
 
+COURT_WIDTH_FT = 27.0   # singles width
+COURT_LENGTH_FT = 78.0  # baseline to baseline
+FT_TO_M = 0.3048
+COURT_WIDTH_M = COURT_WIDTH_FT * FT_TO_M
+COURT_LENGTH_M = COURT_LENGTH_FT * FT_TO_M
+
 
 # =====================================================
 # Helper functions (pure)
 # =====================================================
+
+def _homography_px_to_court_m(TL, TR, BR, BL):
+    """
+    Returns 3x3 homography mapping image pixels (court quad) -> court plane in meters.
+    Court coordinates:
+      (0,0)       (W,0)
+      (0,L)       (W,L)
+    """
+    src = np.float32([TL, TR, BR, BL])
+    dst = np.float32([
+        [0.0, 0.0],
+        [COURT_WIDTH_M, 0.0],
+        [COURT_WIDTH_M, COURT_LENGTH_M],
+        [0.0, COURT_LENGTH_M],
+    ])
+    H = cv2.getPerspectiveTransform(src, dst)
+    return H
+
+
+def _px_points_to_court_m(H, pts_xy):
+    """
+    pts_xy: list of (x,y) in pixels
+    returns: list of (X,Y) in meters in court plane
+    """
+    if not pts_xy:
+        return []
+    arr = np.float32(pts_xy).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(arr, H).reshape(-1, 2)
+    return [(float(p[0]), float(p[1])) for p in out]
+
+
+def _poly_area_m2(pts_xy_m):
+    """
+    Shoelace area for polygon pts in order (e.g., tl,tr,br,bl).
+    Returns positive area (m^2).
+    """
+    if pts_xy_m is None or len(pts_xy_m) < 3:
+        return 0.0
+    x = np.array([p[0] for p in pts_xy_m], dtype=float)
+    y = np.array([p[1] for p in pts_xy_m], dtype=float)
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _second_derivative_nonuniform(t0, t1, t2, f0, f1, f2):
+    """
+    Second derivative at t1 for non-uniform sampling.
+    Uses:
+      f''(t1) ≈ 2 * ( (f2-f1)/(t2-t1) - (f1-f0)/(t1-t0) ) / (t2-t0)
+    """
+    dt10 = max(t1 - t0, 1e-9)
+    dt21 = max(t2 - t1, 1e-9)
+    dt20 = max(t2 - t0, 1e-9)
+    return 2.0 * ((f2 - f1) / dt21 - (f1 - f0) / dt10) / dt20
+
 def crop_with_pad(frame, box, pad=0.15):
     H, W = frame.shape[:2]
     x1, y1, x2, y2 = box
@@ -131,6 +200,84 @@ def toss_roi_from_player_box(frame_shape, player_box):
     return (rx1, ry1, rx2, ry2)
 
 
+def create_auto_exclusion_zones(
+    video_path: str,
+    ball_model,
+    num_frames: int = 10,
+    conf: float = 0.05,
+    eps: int = 30,
+    min_samples: int = 5,
+    padding: int = 25,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Analyzes a video to find static clusters of objects that look like balls (e.g., baskets)
+    and returns a list of exclusion zones (rectangles) to mask them out.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames < num_frames:
+        cap.release()
+        return []
+
+    frame_indices = random.sample(range(total_frames), num_frames)
+    
+    all_detections = []
+    for frame_idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        
+        res = ball_model(frame, verbose=False, conf=conf)
+        if res and res[0].boxes:
+            for b in res[0].boxes:
+                # Assuming ball is class 0, which is the default
+                if int(b.cls[0]) != DEFAULT_BALL_CLASS_INDEX:
+                    continue
+                x1, y1, x2, y2 = b.xyxy[0].tolist()
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                all_detections.append((cx, cy))
+    
+    cap.release()
+
+    if len(all_detections) < min_samples:
+        return []
+
+    # Cluster detections to find static groups
+    X = np.array(all_detections)
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(X)
+    labels = db.labels_
+    
+    unique_labels = set(labels)
+    zones = []
+    
+    for k in unique_labels:
+        if k == -1:
+            # -1 is noise in DBSCAN
+            continue
+        
+        class_member_mask = (labels == k)
+        cluster_points = X[class_member_mask]
+        
+        if len(cluster_points) > 0:
+            x_min, y_min = np.min(cluster_points, axis=0)
+            x_max, y_max = np.max(cluster_points, axis=0)
+            
+            # Add padding to create the zone
+            zones.append((
+                int(x_min - padding),
+                int(y_min - padding),
+                int(x_max + padding),
+                int(y_max + padding),
+            ))
+            
+    return zones
+
+
 # =====================================================
 # points.csv helpers (optional)
 # =====================================================
@@ -193,6 +340,298 @@ def _time_in_windows(t: float, windows: Optional[List[Tuple[float, float]]]) -> 
 
 
 # =====================================================
+# ACTIVEPLAY: Kalman + windowed YOLO tracker
+# =====================================================
+
+@dataclass
+class BallTrackResult:
+    xy: Optional[Tuple[int, int]]
+    seen: bool
+    v_mps: float
+    roi: Optional[Tuple[int, int, int, int]]
+    debug: Dict[str, Any]
+
+
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+class ActivePlayBallTracker:
+    """
+    Tracks ball position after serve using:
+      KF prediction -> dynamic crop window -> YOLO on crop -> KF update.
+    """
+    def __init__(
+        self,
+        *,
+        ball_model,                  # YOLO model instance (already loaded)
+        fps: float,
+        poly,                        # px/ft poly (callable)
+        conf: float = 0.1,
+        base_size: int = 380,
+        uncertainty_scale: float = 0.10,
+        use_perspective: bool = True,
+        min_margin: int = 50,
+        max_margin: int = 360,
+        miss_timeout_s: float = 2.0,
+        min_seen_for_velocity: int = 5,
+        v_thresh_mps: float = 0.5,
+        exclusion_zones: Optional[List[Tuple[int, int, int, int]]] = None,
+    ):
+
+        self.bootstrap_roi: Optional[Tuple[int,int,int,int]] = None
+        self.bootstrap_until_seen: bool = False
+        self.bootstrap_max_s: float = 0.75   # don’t stay stuck here forever
+        self.bootstrap_start_t: float = -1e9
+
+        self.ball_model = ball_model
+        self.fps = float(fps)
+        self.dt = 1.0 / max(self.fps, 1e-6)
+        self.poly = poly
+
+        self.conf = float(conf)
+        self.base_size = int(base_size)
+        self.uncertainty_scale = float(uncertainty_scale)
+        self.use_perspective = bool(use_perspective)
+        self.min_margin = int(min_margin)
+        self.max_margin = int(max_margin)
+
+        self.min_seen_for_velocity = int(min_seen_for_velocity)
+        self.miss_timeout_s = float(miss_timeout_s)
+        self.v_thresh_mps = float(v_thresh_mps)
+        self.exclusion_zones = exclusion_zones if exclusion_zones is not None else []
+
+        # KF: state [x,y,vx,vy] with vx,vy in px/s
+        self.kf = KalmanFilter(dim_x=4, dim_z=2)
+        self.kf.F = np.array([[1, 0, self.dt, 0],
+                              [0, 1, 0, self.dt],
+                              [0, 0, 1, 0],
+                              [0, 0, 0, 1]], dtype=float)
+        self.kf.H = np.array([[1, 0, 0, 0],
+                              [0, 1, 0, 0]], dtype=float)
+        self.kf.R = np.eye(2, dtype=float) * 10.0
+        self.kf.Q = np.eye(4, dtype=float) * 25.0
+        self.kf.P0 = np.eye(4, dtype=float) * 100.0
+
+        self.reset()
+    
+
+    def set_bootstrap_roi(self, roi: Tuple[int,int,int,int], time_s: float, *, until_seen: bool = True):
+        """Force initial search window to this ROI for a short time or until first detection."""
+        self.bootstrap_roi = roi
+        self.bootstrap_until_seen = bool(until_seen)
+        self.bootstrap_start_t = float(time_s)
+
+    def reset(self):
+        self.kf.x = np.zeros((4, 1), dtype=float)
+        self.kf.P = self.kf.P0.copy()
+        self.initialized = False
+        self.last_seen_t = -1e9
+        self.track = []
+
+        # If you add bootstrap ROI logic:
+        self.bootstrap_roi = None
+        self.bootstrap_start_t = -1e9
+        self.bootstrap_until_seen = False
+
+        # If you visualize/debug:
+        self.last_roi = None
+        self.last_pred_xy = None
+        self.miss_streak = 0
+
+        self.seen_count = 0
+
+    def init_from_xy(self, xy: Tuple[float, float], time_s: float):
+        x0, y0 = float(xy[0]), float(xy[1])
+        self.kf.x = np.array([[x0], [y0], [0.0], [0.0]], dtype=float)
+        self.kf.P = self.kf.P0.copy()
+        self.initialized = True
+        self.last_seen_t = float(time_s)
+        self.track = [(int(x0), int(y0))]
+        self.seen_count = 0
+
+    def _best_det_in_window(
+        self, window: np.ndarray, pred_win_xy: Tuple[float, float], win_x1: int, win_y1: int
+    ) -> Optional[Tuple[float, float]]:
+        px, py = pred_win_xy
+        res = self.ball_model(window, verbose=False, conf=self.conf)
+        if not res or res[0].boxes is None or len(res[0].boxes) == 0:
+            return None
+
+        best = None
+        best_dist = float("inf")
+        for b in res[0].boxes:
+            x1, y1, x2, y2 = b.xyxy[0].tolist()
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+
+            # Check if the detection is inside an exclusion zone
+            full_cx, full_cy = win_x1 + cx, win_y1 + cy
+            is_excluded = False
+            for zx1, zy1, zx2, zy2 in self.exclusion_zones:
+                if zx1 <= full_cx <= zx2 and zy1 <= full_cy <= zy2:
+                    is_excluded = True
+                    break
+            if is_excluded:
+                continue
+
+            d = (cx - px) ** 2 + (cy - py) ** 2
+            if d < best_dist:
+                best_dist = d
+                best = (cx, cy)
+        return best
+
+    def step(self, frame: np.ndarray, time_s: float) -> BallTrackResult:
+        H, W = frame.shape[:2]
+
+        if not self.initialized and self.bootstrap_roi is None:
+            return BallTrackResult(xy=None, seen=False, v_mps=0.0, roi=None, debug={"reason": "not_initialized"})
+
+        # -------------------------------------------------
+        # 1) Choose ROI for this frame (bootstrap vs KF window)
+        # -------------------------------------------------
+        use_bootstrap = False
+        if self.bootstrap_roi is not None:
+            if self.bootstrap_until_seen:
+                # Stay in bootstrap ROI indefinitely until we see a detection.
+                use_bootstrap = True
+            else:
+                # Time-limited bootstrap ROI.
+                if (time_s - self.bootstrap_start_t) <= self.bootstrap_max_s:
+                    use_bootstrap = True
+                else:
+                    # expired
+                    self.bootstrap_roi = None
+
+        if use_bootstrap:
+            x1, y1, x2, y2 = self.bootstrap_roi
+            x1 = _clamp(int(x1), 0, W - 1); y1 = _clamp(int(y1), 0, H - 1)
+            x2 = _clamp(int(x2), 1, W);     y2 = _clamp(int(y2), 1, H)
+
+            window = frame[y1:y2, x1:x2]
+
+            # Predict for continuity if initialized; otherwise "predict" at ROI center
+            if self.initialized:
+                self.kf.predict()
+                pred_x = float(self.kf.x[0, 0])
+                pred_y = float(self.kf.x[1, 0])
+            else:
+                pred_x = 0.5 * (x1 + x2)
+                pred_y = 0.5 * (y1 + y2)
+
+            pred_win = (pred_x - x1, pred_y - y1)
+
+            det_win = self._best_det_in_window(window, pred_win, x1, y1)
+            seen = False
+
+            if det_win is not None:
+                det_full = (x1 + det_win[0], y1 + det_win[1])
+
+                if not self.initialized:
+                    self.init_from_xy(det_full, time_s=time_s)
+                else:
+                    z = np.array([[float(det_full[0])], [float(det_full[1])]], dtype=float)
+                    self.kf.update(z)
+
+                seen = True
+                self.last_seen_t = float(time_s)
+                self.seen_count += 1
+
+                # If configured, stop bootstrapping as soon as we see the ball once.
+                if self.bootstrap_until_seen:
+                    self.bootstrap_roi = None
+
+            if self.initialized:
+                xy = (int(self.kf.x[0, 0]), int(self.kf.x[1, 0]))
+                self.track.append(xy)
+                v_mps = self._speed_mps()
+                return BallTrackResult(
+                    xy=xy, seen=seen, v_mps=v_mps, roi=(x1, y1, x2, y2),
+                    debug={"mode": "bootstrap_roi", "until_seen": self.bootstrap_until_seen}
+                )
+
+            return BallTrackResult(
+                xy=None, seen=False, v_mps=0.0, roi=(x1, y1, x2, y2),
+                debug={"mode": "bootstrap_roi", "reason": "no_seed_yet", "until_seen": self.bootstrap_until_seen}
+            )
+
+        # 1) predict
+        self.kf.predict()
+        pred_x = float(self.kf.x[0, 0])
+        pred_y = float(self.kf.x[1, 0])
+
+        # 2) margin from uncertainty
+        uncertainty = float(np.trace(self.kf.P[:2, :2]))
+        margin = int(self.base_size + uncertainty * self.uncertainty_scale)
+
+        if self.use_perspective:
+            # shrink window towards far side
+            perspective_factor = max(0.5, 1.0 - (pred_y / max(1.0, float(H))))
+            margin = int(margin * perspective_factor)
+
+        margin = _clamp(margin, self.min_margin, self.max_margin)
+
+        # 3) crop window
+        x1 = _clamp(int(pred_x - margin), 0, W - 1)
+        y1 = _clamp(int(pred_y - margin), 0, H - 1)
+        x2 = _clamp(int(pred_x + margin), 1, W)
+        y2 = _clamp(int(pred_y + margin), 1, H)
+
+        if x2 <= x1 + 2 or y2 <= y1 + 2:
+            # degenerate
+            xy = (int(self.kf.x[0, 0]), int(self.kf.x[1, 0]))
+            v_mps = self._speed_mps()
+            self.track.append(xy)
+            return BallTrackResult(xy=xy, seen=False, v_mps=v_mps, roi=(x1, y1, x2, y2),
+                                   debug={"uncertainty": uncertainty, "margin": margin, "reason": "degenerate_roi"})
+
+        window = frame[y1:y2, x1:x2]
+        pred_win = (pred_x - x1, pred_y - y1)
+        det_win = self._best_det_in_window(window, pred_win, x1, y1)
+
+        seen = False
+        if det_win is not None:
+            det_full = (x1 + det_win[0], y1 + det_win[1])
+            z = np.array([[float(det_full[0])], [float(det_full[1])]], dtype=float)
+            self.kf.update(z)
+            seen = True
+            self.last_seen_t = float(time_s)
+
+        xy = (int(self.kf.x[0, 0]), int(self.kf.x[1, 0]))
+        self.track.append(xy)
+
+        v_mps = self._speed_mps()
+
+        return BallTrackResult(
+            xy=xy,
+            seen=seen,
+            v_mps=v_mps,
+            roi=(x1, y1, x2, y2),
+            debug={"uncertainty": uncertainty, "margin": margin, "seen": seen},
+        )
+
+    def _speed_mps(self) -> float:
+        # KF vx,vy are px/s (because F uses dt)
+        vx = float(self.kf.x[2, 0])
+        vy = float(self.kf.x[3, 0])
+        v_pxps = math.hypot(vx, vy)
+
+        y = float(self.kf.x[1, 0])
+        ppf = float(self.poly(y))  # px/ft
+        v_ftps = v_pxps / max(ppf, 1e-6)
+        return v_ftps * 0.3048
+
+    def should_end_activeplay(self, time_s: float) -> bool:
+        if (time_s - float(self.last_seen_t)) > self.miss_timeout_s:
+            return True
+        if self.seen_count >= int(self.min_seen_for_velocity):
+            if self._speed_mps() < self.v_thresh_mps:
+                return True
+        return False
+
+
+
+# =====================================================
 # MAIN FUNCTION
 # =====================================================
 def detect_serve_event_times(
@@ -242,6 +681,16 @@ def detect_serve_event_times(
     trophy_model = YOLO(trophy_model_path)
     ball_model = YOLO(ball_model_path)
 
+    # Auto-generate exclusion zones for static objects
+    print("\n[INFO] Analyzing video for static objects to exclude...")
+    try:
+        exclusion_zones = create_auto_exclusion_zones(input_video, ball_model)
+        if exclusion_zones:
+            print(f"[INFO] Found {len(exclusion_zones)} static zone(s) to exclude.")
+    except Exception as e:
+        print(f"[WARN] Could not run auto-exclusion analysis: {e}")
+        exclusion_zones = []
+
     # points.csv windows (optional)
     point_windows = _load_point_windows(points_csv)
 
@@ -264,6 +713,20 @@ def detect_serve_event_times(
     poly = compute_px_per_ft_poly(court_vertices)
     physics = ServePhysics(poly, court_vertices)
 
+    # Initialize Kalman Filter
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    active_tracker = ActivePlayBallTracker(
+        ball_model=ball_model,
+        fps=fps,
+        poly=poly,
+        conf=0.1,
+        miss_timeout_s=2.0,
+        v_thresh_mps=0.5,
+        exclusion_zones=exclusion_zones,
+    )
+    end_times: List[float] = []
+    active_point = False
+
     print("\nStarting serve detection...\n")
     print(f"[INFO] Trophy model: {trophy_model_path}")
     print(f"[INFO] Ball model:   {ball_model_path}")
@@ -279,6 +742,8 @@ def detect_serve_event_times(
     bottom_two = sorted_by_y[2:]
     TL, TR = sorted(top_two, key=lambda p: p[0])
     BL, BR = sorted(bottom_two, key=lambda p: p[0])
+    H_px_to_m = _homography_px_to_court_m(TL, TR, BR, BL)
+
 
     # Optional telemetry CSV
     csv_file = None
@@ -342,13 +807,26 @@ def detect_serve_event_times(
     serve_times: List[float] = []
     last_debug_print_t = -1.0
     frame_idx = 0
+    active_point = False # Assumes we start in dead time
+    active_point_start_t = None
+
+    # -------------------------------------------------
+    # Player dynamics logging (court-plane, meters)
+    # -------------------------------------------------
+    dyn_rows = []  # will store per-frame raw values; we compute 2nd derivatives after the loop
+    # each row will hold:
+    #   time_s,
+    #   pos_m=(X,Y),
+    #   corners_m=[tl,tr,br,bl] in meters,
+    #   area_m2
+
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        frame_idx += 1
+        frame_idx += 10
 
         time_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         time_s = time_ms / 1000.0
@@ -389,6 +867,35 @@ def detect_serve_event_times(
             continue
 
         player_box = min(serve_candidates, key=lambda x: x[1])[0]
+
+        # ----------------------------------------------
+        # Player dynamics in court meters (assume on ground plane)
+        # ----------------------------------------------
+        x1, y1, x2, y2 = player_box
+
+        # (2) player position = bottom-center of bbox in meters
+        bc_px = (0.5 * (x1 + x2), y2)
+
+        # (3) bbox corners projected onto court plane (meters)
+        tl_px = (x1, y1)
+        tr_px = (x2, y1)
+        br_px = (x2, y2)
+        bl_px = (x1, y2)
+
+        pos_m = _px_points_to_court_m(H_px_to_m, [bc_px])[0]
+        corners_m = _px_points_to_court_m(H_px_to_m, [tl_px, tr_px, br_px, bl_px])  # order: tl,tr,br,bl
+        area_m2 = _poly_area_m2(corners_m)
+
+        dyn_rows.append({
+            "time_s": float(time_s),
+            "pos_x_m": pos_m[0],
+            "pos_y_m": pos_m[1],
+            "tl_x_m": corners_m[0][0], "tl_y_m": corners_m[0][1],
+            "tr_x_m": corners_m[1][0], "tr_y_m": corners_m[1][1],
+            "br_x_m": corners_m[2][0], "br_y_m": corners_m[2][1],
+            "bl_x_m": corners_m[3][0], "bl_y_m": corners_m[3][1],
+            "area_m2": float(area_m2),
+        })
 
         # ----------------------------------------------
         # 3) Trophy classifier (every frame)
@@ -441,7 +948,76 @@ def detect_serve_event_times(
         if event == "serve_start":
             print(f"[{time_s:0.3f}s] EVENT: serve_start (quiet until {physics.quiet_until_t:0.2f}s)")
             serve_times.append(float(time_s))
+            active_point = True
 
+        
+
+        # ----------------------------------------------
+        # 7) ACTIVEPLAY ball tracking (KF + windowed YOLO)
+        # ----------------------------------------------
+        if event == "serve_start":
+            active_point = True
+            active_point_start_t = time_s
+
+            # Reset ONCE
+            active_tracker.reset()
+
+            # Prevent immediate timeout before first detection
+            active_tracker.last_seen_t = time_s
+
+            # Bootstrap search = toss ROI
+            active_tracker.set_bootstrap_roi(roi, time_s=time_s, until_seen=True)
+
+            # If we already detected the ball in toss ROI this same frame, seed KF
+            if ball_det is not None:
+                bx, by, _ = ball_det
+                active_tracker.init_from_xy((bx, by), time_s=time_s)
+                active_tracker.bootstrap_roi = None  # optional: since we already saw it
+
+
+        if active_point:
+            # If tracker isn't initialized yet, let it bootstrap inside toss ROI first.
+            # (Optional) after some time, do ONE global seed attempt.
+            if (not active_tracker.initialized) and (time_s - active_point_start_t) > 0.25:
+                resb = ball_model(frame, verbose=False, conf=0.25)[0]
+                best_seed = None
+                best_conf = -1.0
+                if resb.boxes:
+                    for b in resb.boxes:
+                        if int(b.cls[0]) != ball_class_index:
+                            continue
+                        conf = float(b.conf[0])
+                        if conf > best_conf:
+                            x1, y1, x2, y2 = b.xyxy[0].tolist()
+                            best_seed = (0.5*(x1+x2), 0.5*(y1+y2))
+                            best_conf = conf
+                if best_seed is not None:
+                    active_tracker.init_from_xy(best_seed, time_s=time_s)
+
+            # STEP ONCE
+            track_out = active_tracker.step(frame, time_s)
+
+            # Draw search ROI + tracked point
+            if show_ui and track_out.roi is not None:
+                x1, y1, x2, y2 = track_out.roi
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(frame, "KF search", (x1, max(20, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            if show_ui and track_out.xy is not None:
+                tx, ty = track_out.xy
+                cv2.circle(frame, (tx, ty), 6, (0, 255, 255), -1)
+                cv2.putText(frame, f"ACTIVE v={track_out.v_mps:.2f} m/s", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+            # Terminate ACTIVEPLAY only after grace
+            if (time_s - active_point_start_t) > 0.5:
+                # Stronger rule: require at least one “seen” detection before allowing velocity-based stop
+                # (Optional but recommended)
+                if active_tracker.initialized and active_tracker.should_end_activeplay(time_s):
+                    active_point = False
+                    end_times.append(float(time_s))
+                    active_tracker.reset()
         # ----------------------------------------------
         # 7) CSV log (optional)
         # ----------------------------------------------
@@ -479,6 +1055,12 @@ def detect_serve_event_times(
         # 8) Visualization (optional)
         # ----------------------------------------------
         if show_ui:
+            # Draw exclusion zones (if any) as semi-transparent overlays
+            overlay = frame.copy()
+            for zx1, zy1, zx2, zy2 in exclusion_zones:
+                cv2.rectangle(overlay, (zx1, zy1), (zx2, zy2), (255, 0, 255), -1)
+            frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
+
             ready_ok = (
                 p_state.in_ready and
                 p_state.ready_duration_s >= float(physics.ready_min_s) and
@@ -539,6 +1121,7 @@ def detect_serve_event_times(
             bs = physics.ball_state
             print(
                 f"[DEBUG {time_s:7.2f}s] "
+                f"active point={active_point}"
                 f"in_ready={p_state.in_ready} ready_dur={p_state.ready_duration_s:4.2f}s quiet={quiet_now} | "
                 f"ball_seen={'Y' if bs.last_ball_seen_t is not None else 'N'} "
                 f"vy_up={bs.vy_up_pxps:7.1f}px/s up_streak={bs.up_streak:2d} onset={bs.toss_onset_t} | "
@@ -558,6 +1141,76 @@ def detect_serve_event_times(
     if show_ui:
         cv2.destroyAllWindows()
 
+    # --- Player Dynamics CSV Output ---
+    if dyn_rows:
+        print("\n[INFO] Computing player dynamics (2nd derivatives) and saving CSV...")
+
+        out_csv = "player_box_dynamics_court_m.csv"
+        with open(out_csv, "w", newline="") as f:
+            w = csv.writer(f)
+
+            w.writerow([
+                "time_s",
+
+                # (2) bottom-center position (meters)
+                "player_bc_x_m", "player_bc_y_m",
+
+                # (3) projected bbox corners (meters)
+                "tl_x_m", "tl_y_m",
+                "tr_x_m", "tr_y_m",
+                "bl_x_m", "bl_y_m",
+                "br_x_m", "br_y_m",
+
+                # helpful raw scalar
+                "bbox_area_m2",
+
+                # (4) second derivative of position (acceleration)
+                "acc_x_mps2", "acc_y_mps2", "acc_mag_mps2",
+
+                # (5) second derivative of area
+                "area_ddot_m2ps2",
+            ])
+
+            n = len(dyn_rows)
+            for i in range(n):
+                r = dyn_rows[i]
+                t = r["time_s"]
+
+                # Defaults at boundaries (no symmetric neighbors)
+                acc_x = acc_y = acc_mag = 0.0
+                area_ddot = 0.0
+
+                if 0 < i < n - 1:
+                    r0 = dyn_rows[i - 1]
+                    r1 = dyn_rows[i]
+                    r2 = dyn_rows[i + 1]
+
+                    t0, t1, t2 = r0["time_s"], r1["time_s"], r2["time_s"]
+
+                    # position second derivative (component-wise)
+                    acc_x = _second_derivative_nonuniform(t0, t1, t2, r0["pos_x_m"], r1["pos_x_m"], r2["pos_x_m"])
+                    acc_y = _second_derivative_nonuniform(t0, t1, t2, r0["pos_y_m"], r1["pos_y_m"], r2["pos_y_m"])
+                    acc_mag = float(math.hypot(acc_x, acc_y))
+
+                    # area second derivative
+                    area_ddot = _second_derivative_nonuniform(t0, t1, t2, r0["area_m2"], r1["area_m2"], r2["area_m2"])
+
+                w.writerow([
+                    t,
+                    r["pos_x_m"], r["pos_y_m"],
+
+                    r["tl_x_m"], r["tl_y_m"],
+                    r["tr_x_m"], r["tr_y_m"],
+                    r["bl_x_m"], r["bl_y_m"],
+                    r["br_x_m"], r["br_y_m"],
+
+                    r["area_m2"],
+
+                    acc_x, acc_y, acc_mag,
+                    area_ddot,
+                ])
+
+        print(f"[INFO] Player dynamics CSV saved to {out_csv}")
     return serve_times
 
 

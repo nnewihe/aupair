@@ -25,11 +25,13 @@ from typing import List, Optional, Tuple
 try:
     from src.vision.court_mask import find_court_mask
     from src.vision.serve_physics import ServePhysics
+    from src.vision.track_ball import get_ball_position
 except ImportError:
     root = pathlib.Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root))
     from src.vision.court_mask import find_court_mask
     from src.vision.serve_physics import ServePhysics
+    from src.vision.track_ball import get_ball_position
 
 
 # =====================================================
@@ -41,9 +43,9 @@ DEFAULT_TROPHY_PAD = 0.15
 
 DEFAULT_BALL_MODEL_PATH = "weights/ball/weights/best.pt"
 DEFAULT_BALL_CLASS_INDEX = 0
-
 DEFAULT_DEBUG_PRINT_INTERVAL = 0.5
 DEFAULT_BALL_CONF_MIN = 0.10
+
 DEFAULT_DRAW_TOSS_ROI = True
 
 
@@ -101,34 +103,7 @@ def compute_px_per_ft_poly(corners):
     return np.poly1d([a, b])
 
 
-def toss_roi_from_player_box(frame_shape, player_box):
-    """
-    Returns an ROI (rx1,ry1,rx2,ry2) where we expect the tossed ball.
-    Simple heuristic ROI above/around the player's upper body.
-    """
-    H, W = frame_shape[:2]
-    x1, y1, x2, y2 = player_box
-    bw = x2 - x1
-    bh = y2 - y1
 
-    # Horizontal: expand beyond shoulders
-    rx1 = int(x1 - 0.25 * bw)
-    rx2 = int(x2 + 0.25 * bw)
-
-    # Vertical: from above head only
-    ry1 = int(y1 - 1.0 * bh)
-    ry2 = int(y1 + 0.2 * bh)
-
-    rx1 = max(0, min(W - 1, rx1))
-    rx2 = max(0, min(W - 1, rx2))
-    ry1 = max(0, min(H - 1, ry1))
-    ry2 = max(0, min(H - 1, ry2))
-
-    # Ensure valid box
-    if rx2 <= rx1 + 2 or ry2 <= ry1 + 2:
-        return (0, 0, W - 1, H - 1)
-
-    return (rx1, ry1, rx2, ry2)
 
 
 # =====================================================
@@ -240,7 +215,7 @@ def detect_serve_event_times(
     # YOLO models
     player_model = YOLO("yolov8n.pt")
     trophy_model = YOLO(trophy_model_path)
-    ball_model = YOLO(ball_model_path)
+
 
     # points.csv windows (optional)
     point_windows = _load_point_windows(points_csv)
@@ -262,7 +237,8 @@ def detect_serve_event_times(
 
     court_vertices = res.poly
     poly = compute_px_per_ft_poly(court_vertices)
-    physics = ServePhysics(poly, court_vertices)
+    fps = cap.get(cv2.CAP_PROP_FPS) # Get fps here
+    physics = ServePhysics(poly, court_vertices, ball_model_path=ball_model_path, fps=fps)
 
     print("\nStarting serve detection...\n")
     print(f"[INFO] Trophy model: {trophy_model_path}")
@@ -313,31 +289,7 @@ def detect_serve_event_times(
                 out.append([x1, y1, x2, y2])
         return out
 
-    def get_best_ball_in_roi_local(frame, roi, conf_min=0.10):
-        rx1, ry1, rx2, ry2 = roi
-        resb = ball_model(frame, verbose=False)[0]
-
-        best = None
-        best_conf = -1.0
-
-        for b in resb.boxes:
-            cls = int(b.cls[0])
-            if cls != ball_class_index:
-                continue
-            conf = float(b.conf[0])
-            if conf < conf_min:
-                continue
-
-            x1, y1, x2, y2 = b.xyxy[0].tolist()
-            cx = 0.5 * (x1 + x2)
-            cy = 0.5 * (y1 + y2)
-
-            if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                if conf > best_conf:
-                    best_conf = conf
-                    best = (cx, cy, conf)
-
-        return best
+    
 
     serve_times: List[float] = []
     last_debug_print_t = -1.0
@@ -419,18 +371,8 @@ def detect_serve_event_times(
         #    Armed = in_ready AND not in quiet
         # ----------------------------------------------
         quiet_now = physics.in_quiet(time_s)
-        roi = toss_roi_from_player_box(frame.shape, player_box)
 
-        ball_det = None
-        if p_state.in_ready and (not quiet_now):
-            ball_det = get_best_ball_in_roi_local(frame, roi, conf_min=ball_conf_min)
-
-        ball_center = None
-        if ball_det is not None:
-            bx, by, bconf = ball_det
-            ball_center = (float(bx), float(by))
-
-        physics.update_ball(ball_center, time_s)
+        current_ball_pos = physics.update_ball(frame, time_s, p_state)
 
         # ----------------------------------------------
         # 6) Serve detection (toss_max + trophy_max)
@@ -452,9 +394,9 @@ def detect_serve_event_times(
             cy_ft = p_state.sm_cy_ft if p_state.sm_cy_ft is not None else 0.0
             in_ready = 1 if p_state.in_ready else 0
 
-            bx, by, bconf = ("", "", "")
-            if ball_det is not None:
-                bx, by, bconf = ball_det
+            ball_x_px, ball_y_px = "", ""
+            if current_ball_pos is not None:
+                ball_x_px, ball_y_px = current_ball_pos[0], current_ball_pos[1]
 
             csv_writer.writerow([
                 time_s,
@@ -464,7 +406,7 @@ def detect_serve_event_times(
                 float(p_state.ready_duration_s),
                 bool(quiet_now),
                 float(trophy_conf),
-                bx, by, bconf,
+                ball_x_px, ball_y_px, # No ball confidence from ServePhysics
                 float(getattr(physics.ball_state, "vy_up_pxps", 0.0)),
                 int(getattr(physics.ball_state, "up_streak", 0)),
                 float(physics.toss_score),
@@ -493,13 +435,13 @@ def detect_serve_event_times(
                 box_color, 2
             )
 
-            if draw_toss_roi:
-                rx1, ry1, rx2, ry2 = roi
-                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (80, 80, 80), 2)
-
-            if ball_det is not None:
-                cx, cy, conf = ball_det
-                cv2.circle(frame, (int(cx), int(cy)), 6, (0, 200, 255), -1)
+            # Draw the ball trace and current position from ServePhysics
+            frame = physics.draw_track(frame)
+            if current_ball_pos is not None:
+                color = (0, 200, 255) # Orange for toss detection
+                if physics.is_tracking_serve:
+                    color = (255, 0, 0) # Blue for Kalman tracked ball
+                cv2.circle(frame, (int(current_ball_pos[0]), int(current_ball_pos[1])), 6, color, -1)
 
             # Bottom-right big overlay
             H, W = frame.shape[:2]
@@ -540,7 +482,7 @@ def detect_serve_event_times(
             print(
                 f"[DEBUG {time_s:7.2f}s] "
                 f"in_ready={p_state.in_ready} ready_dur={p_state.ready_duration_s:4.2f}s quiet={quiet_now} | "
-                f"ball_seen={'Y' if bs.last_ball_seen_t is not None else 'N'} "
+                f"TRACKING={'Y' if physics.is_tracking_serve else 'N'} ball_pos={current_ball_pos} | "
                 f"vy_up={bs.vy_up_pxps:7.1f}px/s up_streak={bs.up_streak:2d} onset={bs.toss_onset_t} | "
                 f"toss={physics.toss_score:4.2f} toss_max={physics.toss_max_ready:4.2f} | "
                 f"trophy={trophy_conf:4.2f} trophy_max={physics.trophy_max_ready:4.2f} | "
@@ -572,6 +514,7 @@ if __name__ == "__main__":
     parser.add_argument("--points_csv", help="Path to the points CSV file.", default="")
     parser.add_argument("--near_side_start", action="store_true", help="Flag to indicate the serve is from the near side.")
     parser.add_argument("--show_ui", action="store_true", help="Flag to show the UI.")
+    parser.add_argument("--ball_model_path", default=DEFAULT_BALL_MODEL_PATH, help="Path to the ball detection model.")
 
     args = parser.parse_args()
 
@@ -580,6 +523,7 @@ if __name__ == "__main__":
         input_video=args.input_video,
         points_csv=args.points_csv,
         near_side_start=args.near_side_start,
+        ball_model_path=args.ball_model_path,
         write_telemetry_csv=True,
         telemetry_csv_path="serve_log.csv",
         show_ui=args.show_ui,
