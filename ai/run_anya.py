@@ -197,8 +197,8 @@ def render_frame(frame, telemetry, state, engine=None, exclusion_zones=None,
             cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
 
     if state == "ACTIVE" and engine is not None:
-        # ── Ball trace (fading orange trail) ──────────────────────────────
-        trace = list(engine._ball_trace_pixels)
+        # ── Ball trace (fading orange trail, 1.5s window) ─────────────────
+        trace = [(px, py) for _, px, py in engine._trace_ball_history]
         n = len(trace)
         if n >= 2:
             for i in range(1, n):

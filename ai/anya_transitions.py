@@ -67,8 +67,8 @@ class TransitionEngine:
         # ------------------------------------------------------------------
         self.ENERGY_BOOST_SPRINT          = 4.0  # energy/second while sprinting
         self.ENERGY_BOOST_SWING           = 4.0  # energy/second during swing/split-step
-        self.ENERGY_DECAY_WALKING         = 0.25 # energy/second drain while walking
-        self.ENERGY_DECAY_MISSING         = 0.4  # energy/second drain when player not detected
+        self.ENERGY_DECAY_WALKING         = 0.35 # energy/second drain while walking
+        self.ENERGY_DECAY_MISSING         = 0.5  # energy/second drain when player not detected
         self.ENERGY_DECAY_STILL           = 0.25 # energy/second drain while standing still
         self.PLAYER_SPRINT_VELOCITY_FTS   = 7.0  # ft/s (world space) → sprinting
         self.PLAYER_STILL_VELOCITY_FTS    = 2.0  # ft/s (world space) → standing still
@@ -136,10 +136,6 @@ class TransitionEngine:
 
         # EMA-smoothed world position; reset to None on each ACTIVE exit
         self._smoothed_player_world: Optional[Tuple[float, float]] = None
-
-        # Ball trace — pixel centres of speed-validated detections (960×540 space)
-        # maxlen ≈ 2s worth of frames; cleared on each ACTIVE exit
-        self._ball_trace_pixels: deque = deque(maxlen=120)
 
         # ------------------------------------------------------------------
         # Signal to the main loop: timestamp to truncate output on transition.
@@ -353,7 +349,6 @@ class TransitionEngine:
             )
             if nearby < self.TRACE_NEARBY_MIN_COUNT:
                 self._trace_ball_history.append((now, px, py))
-                self._ball_trace_pixels.append((px, py))
 
         for c in candidates:
             px, py = c["pixel_center"]
@@ -582,7 +577,6 @@ class TransitionEngine:
         self._energy_player_positions.clear()
         self._energy_player_boxes.clear()
         self._energy_gait_y_buffer.clear()
-        self._ball_trace_pixels.clear()
         self._smoothed_player_world = None
 
     def _init_active(self, now: float) -> None:
