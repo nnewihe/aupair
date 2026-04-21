@@ -32,8 +32,6 @@ class Config:
     TOSS_BALL_IMGSZ = 320
     ACTIVE_BALL_CONF = 0.15   # confidence threshold for whole-court ball detection (ACTIVE)
     TOSS_BALL_CONF   = 0.10   # confidence threshold for toss ROI ball detection (ARMED)
-    FILTER_BALL_IN_NEAR_PLAYER_BOX = False  # True → discard detections inside near player box
-    FILTER_BALL_IN_FAR_PLAYER_BOX  = False  # True → discard detections inside far player box
     TROPHY_IMGSZ = 320
     COURT_WIDTH_FT = 27.0
     COURT_LENGTH_FT = 78.0

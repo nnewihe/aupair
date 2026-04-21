@@ -464,17 +464,12 @@ class AnyaTelemetryProvider:
                     bx1, by1, bx2, by2 = b.xyxy[0].tolist()
                     bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
 
-                    # Filter: must be inside active-zone polygon and outside exclusion zones.
-                    # Player-box filters are opt-in via Config flags (off by default so that
-                    # contact / volley detections inside the player silhouette are kept).
-                    in_near = (Config.FILTER_BALL_IN_NEAR_PLAYER_BOX and
-                               self._is_in_player_box(bcx, bcy, p_box, padding=15))
-                    in_far  = (Config.FILTER_BALL_IN_FAR_PLAYER_BOX and
-                               self._is_in_player_box(bcx, bcy, far_box, padding=10))
+                    # Filter: must be inside active-zone polygon, outside exclusion zones,
+                    # and not inside the near or far player bounding box (10px padding).
                     if (self._is_in_active_zone(bcx, bcy) and
                             not _is_in_exclusion_zone(bcx, bcy, self.exclusion_zones) and
-                            not in_near and
-                            not in_far):
+                            not self._is_in_player_box(bcx, bcy, p_box,   padding=10) and
+                            not self._is_in_player_box(bcx, bcy, far_box, padding=10)):
                         telemetry.active_ball_candidates.append({
                             "box":          (bx1, by1, bx2, by2),
                             "conf":         float(b.conf[0]),
