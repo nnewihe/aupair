@@ -1,18 +1,39 @@
 """
 anya_transitions.py
 ===================
-State machine logic. Consumes the rolling 5-second telemetry buffer
-from anya_base.py to determine state transitions.
+State machine logic. Determines transitions between WAITING, ARMED, and ACTIVE
+based on the rolling telemetry buffer from anya_base.py.
 
-All transition decision logic is consolidated here. Detection (running YOLO
-models, computing raw scores) is handled by AnyaTelemetryProvider in anya_base.py.
+ACTIVE → WAITING uses a two-stage hybrid model:
+
+  Stage 1 — Ball Trace Gate (primary):
+    If an active ball trace exists within the BALL_TIMEOUT window (i.e. ball
+    candidates are present AND not identified as a stationary cluster by DBSCAN),
+    the point stays ACTIVE unconditionally.
+
+  Stage 2 — Energy Bar Fallback:
+    When no active ball trace has been seen for BALL_TIMEOUT seconds, an energy
+    bar is introduced.  The bar starts at 1.0, anchored to:
+        max(last_active_trace_time, active_start_time + SERVE_TO_ENERGY_DELAY)
+    It decays or boosts each frame based on near-player telemetry (velocity,
+    shape change, walking gait — same model as near_anya.py).  The point dies
+    when the bar reaches 0.
+
+    If a new active ball trace appears while the energy bar is running, the bar
+    is discarded and reset to 1.0 (point stays ACTIVE).  The same two-stage
+    logic applies again if the ball goes quiet a second time.
+
+When a transition fires, `last_transition_time` is set to the anchor time used
+for the energy bar (i.e. when the point effectively died).  The main loop uses
+this to rewind output-video writing.
 """
 
 from collections import deque
 from typing import List, Optional, Tuple
 import math
 
-from src.ai.gait_analyzer import GaitAnalyzer
+import numpy as np
+from sklearn.cluster import DBSCAN
 
 
 class TransitionEngine:
@@ -20,68 +41,51 @@ class TransitionEngine:
         self.fps = fps
 
         # ------------------------------------------------------------------
-        # Thresholds
+        # WAITING
         # ------------------------------------------------------------------
-        # Ready zone (ft; wy < 0 means behind near baseline)
-        self.READY_MIN_DIST_FT        = -0.5
-        self.READY_MAX_DIST_FT        = 3.5
-        self.READY_WAIT_TIME_SEC      = 0.4
+        self.READY_MIN_DIST_FT   = -0.5
+        self.READY_MAX_DIST_FT   = 3.5
+        self.READY_WAIT_TIME_SEC = 0.4
 
-        # Armed band guard
-        self.ARMED_BAND_WINDOW_SEC     = 2.0
-        self.ARMED_OUT_RATIO_THRESHOLD = 0.25
-
-        # Serve detection
+        # ------------------------------------------------------------------
+        # ARMED
+        # ------------------------------------------------------------------
+        self.ARMED_BAND_WINDOW_SEC      = 2.0
+        self.ARMED_OUT_RATIO_THRESHOLD  = 0.25
         self.TRANSITION_SCORE_THRESHOLD = 0.55
         self.EVENT_WINDOW_SECONDS       = 1.2
 
-        # Energy — ball
-        self.ENERGY_BOOST_BALL_FAST        = 1.0
-        self.ENERGY_DECAY_BALL_ROLLING     = 0.3
-        self.ENERGY_DECAY_BALL_OCCLUDED    = 0.2
-        self.ENERGY_DECAY_BALL_DEAD        = 0.2
-        self.ENERGY_DECAY_BALL_ACTION_ZONE = 0.03
-        self.MIN_BALL_VELOCITY_FT_SEC      = 15.0
+        # ------------------------------------------------------------------
+        # ACTIVE — Ball trace detection
+        # ------------------------------------------------------------------
+        self.BALL_TIMEOUT             = 2.5   # seconds — DBSCAN history window
+        self.BALL_DEAD_SPEED_FTS      = 3.0   # ft/s — "stationary" threshold (DBSCAN + trace filter)
+        self.BALL_DEAD_CLUSTER_EPS_FT = 3.0   # ft  — DBSCAN eps
+        self.FAST_BALL_THRESHOLD_FTS  = 15.0  # ft/s — serve/groundstroke speed
+        self.EXTENDED_TIMEOUT_SEC     = 4.0   # extra grace for fast balls
+        self.MAX_BALL_SPEED_FTS       = 176.0 # ft/s — physical upper bound (≈120 mph serve)
+        # Net kill
+        self.NET_Y_FT                 = 39.0  # ft — net cord (midpoint of 78ft court)
+        self.NET_ZONE_HALF_WIDTH_FT   = 2.5   # ft — ±2.5ft either side of net cord
 
-        # Energy — player
-        self.ENERGY_BOOST_PLAYER_ACTION       = 1.0
-        self.ENERGY_BOOST_PLAYER_SPRINT       = 1.0
-        self.ENERGY_DECAY_PLAYER_WALK         = 0.2
-        self.ENERGY_DECAY_PLAYER_WALKING_GAIT = 0.0
-        self.ENERGY_DECAY_PLAYER_MISSING      = 0.3
-        self.SHAPE_CHANGE_THRESHOLD_PX        = 75.0
-        self.PLAYER_WALK_VELOCITY_THRESHOLD   = 2.0
-        self.PLAYER_SPRINT_VELOCITY_THRESHOLD = 6.0
-
-        # Energy — player center variance (world-space, 3-second window)
-        self.PLAYER_VAR_WINDOW_SEC      = 3.0
-        self.PLAYER_VAR_LOW_FT2         = 2.0   # below → low variance → decay
-        self.PLAYER_VAR_HIGH_FT2        = 4.0   # above → high variance → boost
-        self.ENERGY_BOOST_PLAYER_VARIANCE  = 0.1   # boost rate (units/s) at max variance
-        self.ENERGY_DECAY_PLAYER_VARIANCE  = 0.1   # decay rate (units/s) at min variance
-
-        # Action zone / net proximity
-        self.ACTION_ZONE_MAX_Y_FT         = 0.0
-        self.NET_PROXIMITY_COURT_DEPTH_FT = 39.0
-        self.NET_PROXIMITY_PLAYER_SCALE   = 3.0
-        self.NET_PROXIMITY_BALL_SCALE     = 0.0
-
-        # Gait detection (kinematic — MediaPipe knee-angle analysis)
-        # self._gait_analyzer = GaitAnalyzer(fps=fps)  # DISABLED
-
-        # Ball position tracking
-        self.BALL_POSITION_BUFFER_SIZE = 15
-        self.VELOCITY_MEDIAN_WINDOW    = 5
-        self.VELOCITY_WINDOW_SIZE      = 20
-        self.MAX_BALL_SPEED_FT_SEC     = 180.0
-
-        # Ball-lost absolute timeouts
-        self.ABSOLUTE_BALL_LOST_TIMEOUT_ACTIVE = 20.0
-        self.ABSOLUTE_BALL_LOST_TIMEOUT_IDLE   = 6.0
-
-        # Ghost-state / emergency ACTIVE → ARMED override
-        self.GHOST_ENERGY_THRESHOLD = 0.5
-        self.GHOST_TROPHY_THRESHOLD = 0.6
+        # ------------------------------------------------------------------
+        # ACTIVE — Energy bar constants (adapted from near_anya.py Config)
+        # ------------------------------------------------------------------
+        self.ENERGY_BOOST_SPRINT            = 4.0   # energy/second while sprinting
+        self.ENERGY_BOOST_SWING             = 4.0   # energy/second during swing/split-step
+        self.ENERGY_DECAY_WALKING           = 0.4  # energy/second drain while walking
+        self.ENERGY_DECAY_MISSING           = 0.4   # energy/second drain when player not detected
+        self.ENERGY_DECAY_STILL             = 0.25  # energy/second drain while standing still
+        self.PLAYER_SPRINT_VELOCITY_THRESHOLD = 6.0  # px/frame (over window) → sprinting
+        self.PLAYER_STILL_VELOCITY_THRESHOLD  = 1.5  # px/frame (over window) → standing still
+        self.PLAYER_SPRINT_VELOCITY_PPS     = 90    # 90 px / second
+        self.SHAPE_CHANGE_THRESHOLD_PX        = 80.0 # px change in (width + height) → swing
+        self.VELOCITY_WINDOW_SIZE             = 20
+        # Walking gait detection
+        self.GAIT_BUFFER_FRAMES  = 45
+        self.GAIT_MIN_REVERSALS  = 2
+        self.GAIT_MAX_REVERSALS  = 8
+        self.GAIT_MIN_DRIFT_PX   = 10.0
 
         # ------------------------------------------------------------------
         # Persistent state — WAITING
@@ -93,59 +97,71 @@ class TransitionEngine:
         # ------------------------------------------------------------------
         self.armed_band_history: deque = deque()
 
-        # Toss consecutive-frame hysteresis
-        self.toss_consecutive_frames:       int            = 0
-        self.toss_gap_frames:               int            = 0
-        self.toss_ball_above_head_detected: bool           = False
+        self.toss_consecutive_frames:       int             = 0
+        self.toss_gap_frames:               int             = 0
+        self.toss_ball_above_head_detected: bool            = False
         self.toss_min_y_px:                 Optional[float] = None
-        self.last_toss_ball:                Optional[dict]  = None  # {"y", "time"}
+        self.last_toss_ball:                Optional[dict]  = None
 
-        # Rolling score windows (score, timestamp)
         self._trophy_scores: deque = deque()
         self._toss_scores:   deque = deque()
 
-        # ------------------------------------------------------------------
-        # Persistent state — ACTIVE
-        # ------------------------------------------------------------------
-        self.point_energy:       float = 1.0
-        self.active_start_time:  float = 0.0
-        self.last_ball_seen_time: float = 0.0
-        self.energy_lock_until: float = 0.0  # Time until which energy is locked at 1.0
-
-        self.active_ball_positions: deque = deque(maxlen=self.BALL_POSITION_BUFFER_SIZE)
-        self.near_player_positions: deque = deque(maxlen=self.VELOCITY_WINDOW_SIZE)
-        self.near_player_boxes:     deque = deque(maxlen=5)
-
-        # Rolling 3-second buffer of (timestamp, wx, wy) for variance calculation
-        self.near_player_var_buffer: deque = deque()
-
-        # Debug: track last frame's energy contributions
-        self.last_energy_deltas = {
-            # Ball contributions (individual components)
-            "ball_fast_delta": 0.0,
-            "ball_rolling_delta": 0.0,
-            "ball_occluded_delta": 0.0,
-            "ball_dead_delta": 0.0,
-            "ball_action_zone_delta": 0.0,
-            "ball_scale": 1.0,
-            # Individual player contributions
-            "sprint_delta": 0.0,
-            "action_delta": 0.0,
-            "walk_delta": 0.0,
-            "gait_delta": 0.0,
-            "missing_delta": 0.0,
-            "variance_delta": 0.0,
-            "player_scale": 1.0,
+        self.last_serve_scores = {
+            "trophy_score": 0.0,
+            "toss_score":   0.0,
+            "serve_score":  0.0,
         }
 
         # ------------------------------------------------------------------
-        # Persistent state — ARMED
+        # Persistent state — ACTIVE (ball tracking)
         # ------------------------------------------------------------------
-        # Debug: track last serve scores
-        self.last_serve_scores = {
-            "trophy_score": 0.0,
-            "toss_score": 0.0,
-            "serve_score": 0.0,
+        self.active_start_time:   float = 0.0
+        self.last_ball_seen_time: float = 0.0
+
+        # Rolling world-space ball history over BALL_TIMEOUT window: (t, wx, wy)
+        self._active_ball_world_history: deque = deque()
+
+        # Timestamp of the most recent frame that had an active (non-stationary) trace
+        self.last_active_trace_time: float = 0.0
+
+        # DBSCAN result cache
+        self._stationary_cache_len:    int                    = -1
+        self._stationary_cache_result: List[Tuple[float, float]] = []
+
+        # ------------------------------------------------------------------
+        # Persistent state — ACTIVE (energy bar)
+        # ------------------------------------------------------------------
+        self.energy_bar_mode:       bool  = False  # True while energy bar is active
+        self.energy_bar_start_time: float = 0.0    # anchor time for last_transition_time rewind
+        self.point_energy:          float = 1.0
+
+        # Player tracking buffers (pixel space) for energy computation
+        self._energy_player_positions: deque = deque(maxlen=self.VELOCITY_WINDOW_SIZE)
+        self._energy_player_boxes:     deque = deque(maxlen=5)
+        self._energy_gait_y_buffer:    deque = deque(maxlen=self.GAIT_BUFFER_FRAMES)
+        self._player_missing_frames:   int   = 0
+        self.PLAYER_MISSING_GRACE_FRAMES: int = 5
+
+        # Ball trace — pixel centres of speed-validated detections (960×540 space)
+        # maxlen ≈ 2s worth of frames; cleared on each ACTIVE exit
+        self._ball_trace_pixels: deque = deque(maxlen=120)
+
+        # ------------------------------------------------------------------
+        # Signal to the main loop: timestamp to truncate output on transition.
+        # ------------------------------------------------------------------
+        self.last_transition_time: Optional[float] = None
+
+        # Debug snapshot for HUD / CSV
+        self.last_active_debug = {
+            "time_since_trace":    0.0,
+            "has_active_trace":    False,
+            "energy_bar_mode":     False,
+            "point_energy":        1.0,
+            "player_velocity":     0.0,
+            "shape_change":        0.0,
+            "walking_gait":        False,
+            "ball_count":          0,
+            "window_max_speed_fts": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -155,14 +171,12 @@ class TransitionEngine:
     def evaluate_transitions(self, history: deque, current_state: str) -> str:
         if not history:
             return current_state
-
         if current_state == "WAITING":
             return self._check_waiting(history)
-        elif current_state == "ARMED":
+        if current_state == "ARMED":
             return self._check_armed(history)
-        elif current_state == "ACTIVE":
+        if current_state == "ACTIVE":
             return self._check_active(history)
-
         return current_state
 
     # ------------------------------------------------------------------
@@ -203,7 +217,6 @@ class TransitionEngine:
         frame = history[-1]
         now   = frame.timestamp
 
-        # ---- Band tracking (guards ARMED → WAITING) ----
         in_band = False
         if frame.near_player_world is not None:
             _, wy   = frame.near_player_world
@@ -235,17 +248,14 @@ class TransitionEngine:
 
         nx1, ny1, nx2, ny2 = frame.near_player_box
 
-        # ---- Accumulate trophy score ----
-        trophy_score = getattr(frame, 'trophy_score', 0.0) or 0.0
+        trophy_score = getattr(frame, "trophy_score", 0.0) or 0.0
         if trophy_score > 0:
             self._trophy_scores.append((trophy_score, now))
 
-        # ---- Toss detection ----
         toss_score = self._update_toss_detection(frame, ny1, now)
         if toss_score > 0:
             self._toss_scores.append((toss_score, now))
 
-        # Prune stale scores
         for buf in (self._trophy_scores, self._toss_scores):
             while buf and now - buf[0][1] > self.EVENT_WINDOW_SECONDS:
                 buf.popleft()
@@ -254,15 +264,13 @@ class TransitionEngine:
         max_toss    = max((s for s, _ in self._toss_scores),   default=0.0)
         serve_score = 0.2 * max_trophy + 0.8 * max_toss
 
-        # Track serve scores for debug visualization
         self.last_serve_scores = {
             "trophy_score": max_trophy,
-            "toss_score": max_toss,
-            "serve_score": serve_score,
+            "toss_score":   max_toss,
+            "serve_score":  serve_score,
         }
 
         if serve_score >= self.TRANSITION_SCORE_THRESHOLD:
-            # Validate toss reached above player's head
             if self.toss_min_y_px is not None and self.toss_min_y_px >= ny1:
                 print(f"[DEBUG] Toss height invalid: min_y={self.toss_min_y_px:.1f} "
                       f"must be < player_top={ny1}")
@@ -281,15 +289,11 @@ class TransitionEngine:
         return "ARMED"
 
     def _update_toss_detection(self, frame, ny1: float, now: float) -> float:
-        """
-        Update consecutive-frame toss tracking and return a score in [0, 1].
-        Requires is_moving_upward AND is_ball_above_head simultaneously.
-        """
         if not frame.toss_ball_candidates:
-            self.last_toss_ball = None
-            self.toss_gap_frames += 1
+            self.last_toss_ball    = None
+            self.toss_gap_frames  += 1
             if self.toss_gap_frames > 3:
-                self.toss_consecutive_frames = 0
+                self.toss_consecutive_frames       = 0
                 self.toss_ball_above_head_detected = False
             return 0.0
 
@@ -313,13 +317,13 @@ class TransitionEngine:
         self.last_toss_ball = {"y": cy, "time": now}
 
         if is_moving_upward and is_ball_above_head:
-            self.toss_gap_frames = 0
-            self.toss_consecutive_frames += 1
+            self.toss_gap_frames              = 0
+            self.toss_consecutive_frames     += 1
             self.toss_ball_above_head_detected = True
         else:
             self.toss_gap_frames += 1
             if self.toss_gap_frames > 3:
-                self.toss_consecutive_frames = 0
+                self.toss_consecutive_frames       = 0
                 self.toss_ball_above_head_detected = False
 
         if not self.toss_ball_above_head_detected:
@@ -331,289 +335,333 @@ class TransitionEngine:
         return 0.0
 
     # ------------------------------------------------------------------
-    # ACTIVE → WAITING  or  ACTIVE → ARMED (emergency override)
+    # ACTIVE → WAITING  (hybrid ball-trace / energy-bar)
     # ------------------------------------------------------------------
 
     def _check_active(self, history: deque) -> str:
-        frame = history[-1]
-        now   = frame.timestamp
-        dt    = 1.0 / self.fps
+        frame      = history[-1]
+        now        = frame.timestamp
+        candidates = frame.active_ball_candidates or []
 
-        near_pos = frame.near_player_world
-        near_box = frame.near_player_box
+        # ---- 1. Update player tracking buffers for energy computation ----
+        self._update_player_tracking(frame)
 
-        # ---- Update player tracking ----
-        player_velocity = 0.0
-        shape_change    = 0.0
+        # ---- 2. Update ball history (speed-filtered) ----
+        # For each candidate:
+        #   a) Reject if inter-frame speed exceeds MAX_BALL_SPEED_FTS (physically impossible).
+        #   b) Immediately kill the point if ball is in the net zone.
+        #   c) Only add pixel centre to the visual trace if ball is actually moving
+        #      (speed > BALL_DEAD_SPEED_FTS) — stationary detections are excluded from trace.
+        for c in candidates:
+            wx, wy = c.get("world_x", 0.0), c.get("world_y", 0.0)
+            speed_fts = 0.0
 
-        if near_pos:
-            self.near_player_positions.append(near_pos)
-        if near_box:
-            self.near_player_boxes.append(near_box)
+            if self._active_ball_world_history:
+                last_t, last_wx, last_wy = self._active_ball_world_history[-1]
+                dt_ball = now - last_t
+                if dt_ball > 0:
+                    speed_fts = math.hypot(wx - last_wx, wy - last_wy) / dt_ball
+                    if speed_fts > self.MAX_BALL_SPEED_FTS:
+                        continue  # implausible jump — discard
 
-        if len(self.near_player_positions) >= 5:
-            old_p = self.near_player_positions[0]
-            new_p = self.near_player_positions[-1]
-            player_velocity = math.hypot(
-                new_p[0] - old_p[0], new_p[1] - old_p[1]
-            ) / len(self.near_player_positions)
+            # (b) Net kill — ball detected in net zone
+            if abs(wy - self.NET_Y_FT) < self.NET_ZONE_HALF_WIDTH_FT:
+                print(f"\n[TRANSITION] ACTIVE -> WAITING (Ball in Net at wy={wy:.1f}ft). "
+                      f"Immediate kill.")
+                self.last_transition_time = now
+                self._reset_active_state()
+                return "WAITING"
 
-        if len(self.near_player_boxes) >= 5:
-            ob, nb = self.near_player_boxes[0], self.near_player_boxes[-1]
-            shape_change = (abs((nb[2] - nb[0]) - (ob[2] - ob[0])) +
-                            abs((nb[3] - nb[1]) - (ob[3] - ob[1])))
+            self._active_ball_world_history.append((now, wx, wy))
 
-        # ---- Update ball tracking ----
-        best_ball = self._select_best_active_ball(frame.active_ball_candidates or [])
-        if best_ball:
-            proposed = (best_ball["world_x"], best_ball["world_y"], now)
-            if self._validate_ball_jump(proposed):
-                self.active_ball_positions.append(proposed)
-                self.last_ball_seen_time = now
-            else:
-                best_ball = None
+            # (c) Only trace moving ball detections
+            if speed_fts > self.BALL_DEAD_SPEED_FTS:
+                pc = c.get("pixel_center")
+                if pc is not None:
+                    self._ball_trace_pixels.append(pc)
 
-        time_since_ball = now - self.last_ball_seen_time
-        ball_velocity   = self._compute_stable_velocity()
+        while (self._active_ball_world_history and
+               now - self._active_ball_world_history[0][0] > self.BALL_TIMEOUT):
+            self._active_ball_world_history.popleft()
 
-        # ---- Action zone / net proximity ----
-        player_is_active      = (near_pos is not None and
-                                 player_velocity >= self.PLAYER_WALK_VELOCITY_THRESHOLD)
-        player_in_action_zone = False
-        net_proximity_factor  = 0.0
-        if near_pos:
-            wy = near_pos[1]
-            player_in_action_zone = wy > self.ACTION_ZONE_MAX_Y_FT
-            net_proximity_factor  = max(0.0, min(1.0,
-                wy / self.NET_PROXIMITY_COURT_DEPTH_FT))
+        if candidates:
+            self.last_ball_seen_time = now
 
-        # ---- Energy deltas ----
-        ball_delta   = 0.0
-        player_delta = 0.0
+        # ---- 3. Determine whether an active ball trace is present ----
+        # No candidates this frame → no trace, energy bar starts immediately.
+        # Candidates visible → run DBSCAN to check if they're stationary noise.
+        if not candidates:
+            has_active_trace = False
+        else:
+            stationary_clusters = self._get_stationary_clusters()
+            has_active_trace    = not self._is_all_balls_dead(stationary_clusters)
 
-        # Track individual ball components for debug
-        ball_fast_delta = 0.0
-        ball_rolling_delta = 0.0
-        ball_occluded_delta = 0.0
-        ball_dead_delta = 0.0
-        ball_action_zone_delta = 0.0
-
-        if best_ball and ball_velocity > self.MIN_BALL_VELOCITY_FT_SEC:
-            ball_fast_delta = self.ENERGY_BOOST_BALL_FAST * dt
-            ball_delta += ball_fast_delta
-        elif best_ball:
-            ball_rolling_delta = -self.ENERGY_DECAY_BALL_ROLLING * dt
-            ball_delta += ball_rolling_delta
-        elif time_since_ball > 0.25:
-            if player_in_action_zone:
-                ball_action_zone_delta = -self.ENERGY_DECAY_BALL_ACTION_ZONE * dt
-                ball_delta += ball_action_zone_delta
-            elif player_is_active:
-                ball_occluded_delta = -self.ENERGY_DECAY_BALL_OCCLUDED * dt
-                ball_delta += ball_occluded_delta
-            else:
-                ball_dead_delta = -self.ENERGY_DECAY_BALL_DEAD * dt
-                ball_delta += ball_dead_delta
-
-        # walking_gait = (self._gait_analyzer.update(frame.player_crop)
-        #                 if frame.player_crop is not None else False)  # DISABLED
-        walking_gait = False
-
-        # Track individual player contributions for debug
-        sprint_delta = 0.0
-        action_delta = 0.0
-        walk_delta = 0.0
-        gait_delta = 0.0
-        missing_delta = 0.0
-
-        if not near_pos:
-            missing_delta = -self.ENERGY_DECAY_PLAYER_MISSING * dt
-            player_delta -= self.ENERGY_DECAY_PLAYER_MISSING * dt
-        elif player_velocity > self.PLAYER_SPRINT_VELOCITY_THRESHOLD:
-            sprint_delta = self.ENERGY_BOOST_PLAYER_SPRINT * dt
-            player_delta += self.ENERGY_BOOST_PLAYER_SPRINT * dt
-        elif shape_change > self.SHAPE_CHANGE_THRESHOLD_PX:
-            action_delta = self.ENERGY_BOOST_PLAYER_ACTION * dt
-            player_delta += self.ENERGY_BOOST_PLAYER_ACTION * dt
-        elif walking_gait:
-            gait_delta = -self.ENERGY_DECAY_PLAYER_WALKING_GAIT * dt
-            player_delta -= self.ENERGY_DECAY_PLAYER_WALKING_GAIT * dt
-            print('PLAYER IS WALKING BY OUR GAIR DETECTOR')
-        elif player_velocity < self.PLAYER_WALK_VELOCITY_THRESHOLD:
-            walk_delta = -self.ENERGY_DECAY_PLAYER_WALK * dt
-            player_delta -= self.ENERGY_DECAY_PLAYER_WALK * dt
-
-        # ---- Player center variance contribution ----
-        if near_pos:
-            self.near_player_var_buffer.append((now, near_pos[0], near_pos[1]))
-        while (self.near_player_var_buffer and
-               now - self.near_player_var_buffer[0][0] > self.PLAYER_VAR_WINDOW_SEC):
-            self.near_player_var_buffer.popleft()
-
-        variance_delta = self._compute_variance_delta(dt)
-        player_delta += variance_delta
-
-        player_scale = 1.0 + net_proximity_factor * (self.NET_PROXIMITY_PLAYER_SCALE - 1.0)
-        ball_scale   = 1.0 - net_proximity_factor * (1.0 - self.NET_PROXIMITY_BALL_SCALE)
-
-        # Track energy deltas for debug visualization
-        self.last_energy_deltas = {
-            "ball_fast_delta": ball_fast_delta,
-            "ball_rolling_delta": ball_rolling_delta,
-            "ball_occluded_delta": ball_occluded_delta,
-            "ball_dead_delta": ball_dead_delta,
-            "ball_action_zone_delta": ball_action_zone_delta,
-            "ball_scale": ball_scale,
-            "sprint_delta": sprint_delta,
-            "action_delta": action_delta,
-            "walk_delta": walk_delta,
-            "gait_delta": gait_delta,
-            "missing_delta": missing_delta,
-            "variance_delta": variance_delta,
-            "player_scale": player_scale,
+        # ---- 4. Update debug snapshot ----
+        self.last_active_debug = {
+            "time_since_trace":     now - self.last_active_trace_time,
+            "has_active_trace":     has_active_trace,
+            "energy_bar_mode":      self.energy_bar_mode,
+            "point_energy":         self.point_energy,
+            "ball_count":           len(candidates),
+            "window_max_speed_fts": self._window_max_speed(),
+            "ball_in_net":          False,  # updated above on net kill (before reaching here)
         }
 
-        # Apply energy lock: hold at 1.0 for 1.5 seconds after serve detection
-        if now < self.energy_lock_until:
-            self.point_energy = 1.0
-        else:
-            self.point_energy = max(0.0, min(1.0,
-                self.point_energy + player_delta * player_scale + ball_delta * ball_scale))
+        # ---- 5a. Active trace present → point is alive ----
+        if has_active_trace:
+            self.last_active_trace_time = now
+            if self.energy_bar_mode:
+                print(f"[ACTIVE] Ball trace restored at t={now:.2f}s. "
+                      f"Discarding energy bar (was {self.point_energy:.2f}).")
+                self.energy_bar_mode = False
+                self.point_energy    = 1.0
+                self._energy_player_positions.clear()
+                self._energy_player_boxes.clear()
+                self._energy_gait_y_buffer.clear()
+            return "ACTIVE"
 
-        # ---- Primary transition: energy depleted or ball lost ----
-        timeout    = (self.ABSOLUTE_BALL_LOST_TIMEOUT_ACTIVE
-                      if (player_in_action_zone or player_is_active)
-                      else self.ABSOLUTE_BALL_LOST_TIMEOUT_IDLE)
-        force_kill = time_since_ball > timeout
+        # ---- 5b. No active trace → energy bar mode ----
+        if not self.energy_bar_mode:
+            print(f"[ACTIVE] No ball trace. Entering energy bar mode "
+                  f"(anchor={self.last_active_trace_time:.2f}s, now={now:.2f}s).")
+            self.energy_bar_mode       = True
+            self.energy_bar_start_time = self.last_active_trace_time
+            self.point_energy          = 1.0
 
-        if self.point_energy <= 0.0 or force_kill:
-            zone   = ("in_court" if player_in_action_zone
-                      else ("active" if player_is_active else "idle"))
-            reason = ("Energy Depleted" if not force_kill
-                      else f"Ball Missing > {timeout:.1f}s (player {zone})")
+        # ---- 6. Compute and apply energy delta ----
+        dt           = 1.0 / self.fps
+        energy_delta, status = self._compute_energy_delta(frame, dt)
+        self.point_energy = max(0.0, min(1.0, self.point_energy + energy_delta))
+
+        self.last_active_debug.update({
+            "energy_bar_mode":  self.energy_bar_mode,
+            "point_energy":     self.point_energy,
+            "energy_status":    status,
+        })
+
+        # ---- 7. Transition when energy reaches zero ----
+        if self.point_energy <= 0.0:
+            self.last_transition_time = self.energy_bar_start_time
             elapsed = now - self.active_start_time
-            print(f"\n[TRANSITION] ACTIVE -> WAITING. Point dead ({reason}). "
-                  f"Lasted {elapsed:.1f}s. Energy: {self.point_energy:.3f}")
+            print(f"\n[TRANSITION] ACTIVE -> WAITING (Energy Depleted [{status}]). "
+                  f"Lasted {elapsed:.1f}s. Rewind to t={self.energy_bar_start_time:.2f}s.")
             self._reset_active_state()
-
-            # Bypass WAITING if player is already at the baseline
-            if near_pos is not None:
-                _, wy = near_pos
-                if wy < 0 and self.READY_MIN_DIST_FT <= abs(wy) <= self.READY_MAX_DIST_FT:
-                    print("[BYPASS] Player already at baseline. Jumping to ARMED.")
-                    self._reset_armed_state()
-                    return "ARMED"
-
             return "WAITING"
-
-        # ---- Ghost-state / emergency ACTIVE → ARMED override ----
-        trophy_score = getattr(frame, 'trophy_score', 0.0) or 0.0
-        if (self.point_energy < self.GHOST_ENERGY_THRESHOLD and
-                near_pos is not None and
-                trophy_score > self.GHOST_TROPHY_THRESHOLD):
-            _, wy   = near_pos
-            dist_ft = abs(wy)
-            if (wy < 0 and
-                    self.READY_MIN_DIST_FT <= dist_ft <= self.READY_MAX_DIST_FT and
-                    player_velocity < self.PLAYER_WALK_VELOCITY_THRESHOLD):
-                print(f"\n[EMERGENCY OVERRIDE] ACTIVE -> ARMED. "
-                      f"Pose: {trophy_score:.2f}")
-                self._reset_active_state()
-                self._reset_armed_state()
-                self._trophy_scores.append((trophy_score, now))
-                return "ARMED"
 
         return "ACTIVE"
 
     # ------------------------------------------------------------------
-    # Ball selection / velocity helpers
+    # Player tracking helpers for energy computation
     # ------------------------------------------------------------------
 
-    def _select_best_active_ball(self, candidates: List[dict]) -> Optional[dict]:
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-        scored = []
-        for c in candidates:
-            wx, wy = c.get("world_x", 0.0), c.get("world_y", 0.0)
-            score  = c["conf"] * 30.0
-            if self.active_ball_positions:
-                last  = self.active_ball_positions[-1]
-                dist  = math.hypot(wx - last[0], wy - last[1])
-                score += max(0.0, 50.0 - dist) * 2.0
-            scored.append((score, c))
-        return max(scored, key=lambda x: x[0])[1]
+    def _update_player_tracking(self, frame) -> None:
+        """Append near-player box to rolling pixel-space buffers."""
+        near_box = frame.near_player_box
+        if near_box is None:
+            self._player_missing_frames += 1
+            self._energy_gait_y_buffer.clear()
+            return
+        self._player_missing_frames = 0
+        nx1, ny1, nx2, ny2 = near_box
+        cx     = (nx1 + nx2) / 2.0
+        cy_feet = float(ny2)
+        self._energy_player_positions.append((cx, cy_feet))
+        self._energy_player_boxes.append(near_box)
+        self._energy_gait_y_buffer.append(cy_feet)
 
-    def _validate_ball_jump(self, new_pos: Tuple) -> bool:
-        if not self.active_ball_positions:
+    def _compute_energy_delta(self, frame, dt: float):
+        """
+        Return (energy_delta, status_label) for one frame.
+
+        Priority (high → low):
+          1. Player missing                → drain ENERGY_DECAY_MISSING
+          2. Walking gait detected         → drain ENERGY_DECAY_WALKING
+          3. Sprinting (high velocity)     → boost ENERGY_BOOST_SPRINT
+          4. Swing / split-step (shape Δ) → boost ENERGY_BOOST_SWING
+          5. Standing still               → drain ENERGY_DECAY_STILL
+          6. Moving (neutral)             → tiny boost 0.1/s
+        """
+        if self._player_missing_frames > self.PLAYER_MISSING_GRACE_FRAMES:
+            return -(self.ENERGY_DECAY_MISSING * dt), "MISSING"
+
+        if self._detect_walking_gait():
+            return -(self.ENERGY_DECAY_WALKING * dt), "WALKING"
+
+        # Velocity in px/second (FPS-independent)
+        player_velocity_pps = 0.0
+        if len(self._energy_player_positions) >= 5:
+            old_p = self._energy_player_positions[0]
+            new_p = self._energy_player_positions[-1]
+            dist    = math.hypot(new_p[0] - old_p[0], new_p[1] - old_p[1])
+            elapsed = len(self._energy_player_positions) / self.fps
+            player_velocity_pps = dist / elapsed if elapsed > 0 else 0.0
+
+        if player_velocity_pps > self.PLAYER_SPRINT_VELOCITY_PPS:
+            return (self.ENERGY_BOOST_SPRINT * dt), "SPRINTING"
+
+        # Shape change normalised by box height (position-independent)
+        if len(self._energy_player_boxes) >= 5:
+            old_b      = self._energy_player_boxes[0]
+            new_b      = self._energy_player_boxes[-1]
+            box_height = old_b[3] - old_b[1]
+            if box_height > 0:
+                dw = abs((new_b[2] - new_b[0]) - (old_b[2] - old_b[0]))
+                dh = abs((new_b[3] - new_b[1]) - (old_b[3] - old_b[1]))
+                if (dw + dh) / box_height > 0.35:
+                    return (self.ENERGY_BOOST_SWING * dt), "SWING"
+
+        # Still threshold converted to px/s for consistent comparison
+        still_pps = self.PLAYER_STILL_VELOCITY_THRESHOLD * self.fps
+        if player_velocity_pps < still_pps:
+            return -(self.ENERGY_DECAY_STILL * dt), "STILL"
+        return (0.1 * dt), "MOVING"
+
+    def _detect_walking_gait(self) -> bool:
+        """
+        Detect walking gait from oscillatory y-movement of player feet.
+        Returns True if consistent with a walk cadence.
+        """
+        ys = list(self._energy_gait_y_buffer)
+        n  = len(ys)
+        if n < self.GAIT_BUFFER_FRAMES * 0.6:
+            return False
+
+        drift = abs(ys[-1] - ys[0])
+        if drift < self.GAIT_MIN_DRIFT_PX:
+            return False
+
+        # Detrend and count direction reversals
+        residuals = [
+            ys[i] - (ys[0] + (ys[-1] - ys[0]) * (i / (n - 1)))
+            for i in range(n)
+        ]
+        reversals      = 0
+        prev_direction = 0
+        for i in range(1, len(residuals)):
+            delta = residuals[i] - residuals[i - 1]
+            if abs(delta) < 0.5:
+                continue
+            direction = 1 if delta > 0 else -1
+            if prev_direction != 0 and direction != prev_direction:
+                reversals += 1
+            prev_direction = direction
+
+        return self.GAIT_MIN_REVERSALS <= reversals <= self.GAIT_MAX_REVERSALS
+
+    # ------------------------------------------------------------------
+    # Stationary-cluster detection (used to define "active trace")
+    # ------------------------------------------------------------------
+
+    def _get_stationary_clusters(self) -> List[Tuple[float, float]]:
+        """Identify clusters that have stayed stationary for the timeout duration."""
+        buf = self._active_ball_world_history
+        if len(buf) < 5:
+            return []
+
+        if len(buf) == self._stationary_cache_len:
+            return self._stationary_cache_result
+
+        times = np.array([t for t, _, _ in buf])
+        pts   = np.array([[wx, wy] for _, wx, wy in buf])
+
+        if (times[-1] - times[0]) < (self.BALL_TIMEOUT - 0.1):
+            self._stationary_cache_len    = len(buf)
+            self._stationary_cache_result = []
+            return []
+
+        labels = DBSCAN(eps=self.BALL_DEAD_CLUSTER_EPS_FT, min_samples=3).fit_predict(pts)
+        stationary = []
+        for lbl in set(labels):
+            if lbl == -1:
+                continue
+            mask    = labels == lbl
+            c_pts   = pts[mask]
+            c_times = times[mask]
+            t_span  = c_times.max() - c_times.min()
+            if t_span < (self.BALL_TIMEOUT - 0.5):
+                continue
+            diffs = c_pts[:, None, :] - c_pts[None, :, :]
+            max_d = np.sqrt((diffs ** 2).sum(axis=2)).max()
+            if (max_d / t_span) < self.BALL_DEAD_SPEED_FTS:
+                stationary.append(tuple(np.mean(c_pts, axis=0)))
+
+        self._stationary_cache_len    = len(buf)
+        self._stationary_cache_result = stationary
+        return stationary
+
+    def _is_all_balls_dead(self, stationary_clusters) -> bool:
+        """
+        True if all detected ball positions belong to stationary clusters
+        (i.e. no kinetic "trace" of a moving ball).
+        """
+        if not stationary_clusters:
+            return False
+
+        buf = self._active_ball_world_history
+        pts = np.array([[wx, wy] for _, wx, wy in buf])
+
+        kinetic_points = [
+            p for p in pts
+            if not any(
+                math.hypot(p[0] - c[0], p[1] - c[1]) < self.BALL_DEAD_CLUSTER_EPS_FT
+                for c in stationary_clusters
+            )
+        ]
+        if len(kinetic_points) < 3:
             return True
-        last = self.active_ball_positions[-1]
-        dist = math.hypot(new_pos[0] - last[0], new_pos[1] - last[1])
-        dt   = new_pos[2] - last[2]
+
+        kp         = np.array(kinetic_points)
+        trace_span = math.hypot(kp[:, 0].max() - kp[:, 0].min(),
+                                kp[:, 1].max() - kp[:, 1].min())
+        TRACE_THRESHOLD_FT = 8.0
+        return trace_span <= TRACE_THRESHOLD_FT
+
+    # ------------------------------------------------------------------
+    # Speed helpers (used for debug snapshot)
+    # ------------------------------------------------------------------
+
+    def _last_ball_speed_fts(self) -> float:
+        buf = self._active_ball_world_history
+        if len(buf) < 2:
+            return 0.0
+        t1, x1, y1 = buf[-2]
+        t2, x2, y2 = buf[-1]
+        dt = t2 - t1
         if dt <= 0:
-            return dist < 5.0
-        return dist / dt <= self.MAX_BALL_SPEED_FT_SEC
-
-    def _compute_stable_velocity(self) -> float:
-        n = len(self.active_ball_positions)
-        if n < 2:
             return 0.0
-        window   = min(self.VELOCITY_MEDIAN_WINDOW, n - 1)
-        pairwise = []
-        for i in range(n - window, n):
-            prev, curr = self.active_ball_positions[i - 1], self.active_ball_positions[i]
-            dt = curr[2] - prev[2]
-            if dt > 0:
-                pairwise.append(
-                    math.hypot(curr[0] - prev[0], curr[1] - prev[1]) / dt)
-        if not pairwise:
+        return math.hypot(x2 - x1, y2 - y1) / dt
+
+    def _window_max_speed(self) -> float:
+        buf = self._active_ball_world_history
+        if len(buf) < 2:
             return 0.0
-        pairwise.sort()
-        mid = len(pairwise) // 2
-        return ((pairwise[mid - 1] + pairwise[mid]) / 2.0
-                if len(pairwise) % 2 == 0 else pairwise[mid])
-
-    def _compute_variance_delta(self, dt: float) -> float:
-        """
-        Return an energy delta based on the variance of the near player's
-        world-space position over the last PLAYER_VAR_WINDOW_SEC seconds.
-
-        High variance  → positive delta (boost, up to ENERGY_BOOST_PLAYER_VARIANCE * dt)
-        Low variance   → negative delta (decay, down to -ENERGY_DECAY_PLAYER_VARIANCE * dt)
-        Average variance → 0
-        """
-        n = len(self.near_player_var_buffer)
-        if n < 2:
+        t_span = buf[-1][0] - buf[0][0]
+        if t_span <= 0:
             return 0.0
-
-        xs = [e[1] for e in self.near_player_var_buffer]
-        ys = [e[2] for e in self.near_player_var_buffer]
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        variance = sum((x - mean_x) ** 2 + (y - mean_y) ** 2
-                       for x, y in zip(xs, ys)) / n
-
-        low  = self.PLAYER_VAR_LOW_FT2
-        high = self.PLAYER_VAR_HIGH_FT2
-
-        if variance >= high:
-            return self.ENERGY_BOOST_PLAYER_VARIANCE * dt
-        elif variance <= low:
-            return -self.ENERGY_DECAY_PLAYER_VARIANCE * dt
-        else:
-            # Linear interpolation through zero between low and high
-            t = (variance - low) / (high - low)  # 0.0 at low, 1.0 at high
-            if t < 0.5:
-                return -self.ENERGY_DECAY_PLAYER_VARIANCE * dt * (1.0 - 2.0 * t)
-            else:
-                return self.ENERGY_BOOST_PLAYER_VARIANCE * dt * (2.0 * t - 1.0)
+        pts   = np.array([[wx, wy] for _, wx, wy in buf])
+        diffs = pts[:, None, :] - pts[None, :, :]
+        max_d = np.sqrt((diffs ** 2).sum(axis=2)).max()
+        return max_d / t_span
 
     # ------------------------------------------------------------------
-    # Internal reset / init helpers
+    # Helpers — reset / init
     # ------------------------------------------------------------------
 
-    def _reset_armed_state(self):
+    def _post_active_next_state(self, near_pos, default_state: str) -> str:
+        """
+        On ACTIVE → WAITING, bypass WAITING if the player is already inside
+        the ready zone — go straight to ARMED for the next point.
+        """
+        if near_pos is not None:
+            _, wy   = near_pos
+            dist_ft = abs(wy)
+            if wy < 0 and self.READY_MIN_DIST_FT <= dist_ft <= self.READY_MAX_DIST_FT:
+                print("[BYPASS] Player already at baseline. Jumping to ARMED.")
+                self._reset_armed_state()
+                return "ARMED"
+        return default_state
+
+    def _reset_armed_state(self) -> None:
         self.armed_band_history.clear()
         self.toss_consecutive_frames       = 0
         self.toss_gap_frames               = 0
@@ -624,21 +672,30 @@ class TransitionEngine:
         self._toss_scores.clear()
         self.last_serve_scores = {
             "trophy_score": 0.0,
-            "toss_score": 0.0,
-            "serve_score": 0.0,
+            "toss_score":   0.0,
+            "serve_score":  0.0,
         }
 
-    def _reset_active_state(self):
-        self.point_energy = 1.0
-        self.active_ball_positions.clear()
-        self.near_player_positions.clear()
-        self.near_player_boxes.clear()
-        self.near_player_var_buffer.clear()
-        # self._gait_analyzer.reset()  # DISABLED
+    def _reset_active_state(self) -> None:
+        self._active_ball_world_history.clear()
+        self.last_ball_seen_time      = 0.0
+        self.active_start_time        = 0.0
+        self.last_active_trace_time   = 0.0
+        self._stationary_cache_len    = -1
+        self._stationary_cache_result = []
+        self._player_missing_frames = 0
+        # Energy bar
+        self.energy_bar_mode          = False
+        self.energy_bar_start_time    = 0.0
+        self.point_energy             = 1.0
+        self._energy_player_positions.clear()
+        self._energy_player_boxes.clear()
+        self._energy_gait_y_buffer.clear()
+        self._ball_trace_pixels.clear()
 
-    def _init_active(self, now: float):
-        """Reset and initialise ACTIVE-state trackers at the start of a new point."""
+    def _init_active(self, now: float) -> None:
         self._reset_active_state()
-        self.active_start_time   = now
-        self.last_ball_seen_time = now
-        self.energy_lock_until   = now + 1.5  # Lock energy at 1.0 for 1.5 seconds after serve
+        self.active_start_time      = now
+        self.last_ball_seen_time    = now
+        self.last_active_trace_time = now
+        self.last_transition_time   = None

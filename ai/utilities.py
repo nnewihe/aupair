@@ -27,9 +27,11 @@ import shutil
 class Config:
     ANALYSIS_WIDTH = 960
     ANALYSIS_HEIGHT = 540
-    PLAYER_IMGSZ = 480
-    BALL_IMGSZ = 1920
+    PLAYER_IMGSZ = 320
+    BALL_IMGSZ = 640
     TOSS_BALL_IMGSZ = 320
+    ACTIVE_BALL_CONF = 0.20   # confidence threshold for whole-court ball detection (ACTIVE)
+    TOSS_BALL_CONF   = 0.10   # confidence threshold for toss ROI ball detection (ARMED)
     TROPHY_IMGSZ = 320
     COURT_WIDTH_FT = 27.0
     COURT_LENGTH_FT = 78.0
@@ -40,10 +42,32 @@ class Config:
     DEFAULT_NEAR_TROPHY_CLASS_INDEX = 1
     DEFAULT_TROPHY_PAD              = 0.30
     TELEMETRY_BUFFER_SECONDS = 5.0
+    HORIZON_Y_PX             = 200
 
 # =============================================================
 # BoxSmoother  
 # =============================================================
+# Add this to src/ai/utilities.py
+@dataclass
+class Point3D:
+    x: float
+    y: float
+    z: float = 0.0
+
+@dataclass
+class Box:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+    @property
+    def w(self): return self.x2 - self.x1
+    @property
+    def h(self): return self.y2 - self.y1
+
+    def contains(self, x, y):
+        return self.x1 <= x <= self.x2 and self.y1 <= y <= self.y2
 
 @dataclass
 class BoxSmoother:
@@ -51,8 +75,7 @@ class BoxSmoother:
     Exponentially-weighted moving average for a bounding box (cx, cy, w, h).
 
     Uses separate alphas for position and size, and suppresses size updates
-    when the player appears stationary — the single most important guard
-    against false delta_area spikes in the downstream RAI.
+    when the player appears stationary.
 
     Parameters
     ----------

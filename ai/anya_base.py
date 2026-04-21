@@ -9,20 +9,16 @@ Maintains a 5-second rolling buffer of telemetry data.
 import cv2
 import numpy as np
 from ultralytics import YOLO
-# import mediapipe as mp
-# Instead of mediapipe.python..., use the standard solutions path
-# Instead of from mediapipe.solutions import pose
-# import mediapipe.python.solutions.pose as mp_pose
-# from mediapipe.solutions import drawing_utils as mp_drawing
 import json
 import os
 import random
 import math
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Any
 from sklearn.cluster import DBSCAN
 from src.ai.utilities import (BoxSmoother, Config, _is_in_exclusion_zone, init_court,
-                               create_auto_exclusion_zones, get_exclusion_zones_from_frames)
+                               create_auto_exclusion_zones, get_exclusion_zones_from_frames, Point3D, Box)
 from collections import deque
 
 @dataclass
@@ -32,6 +28,7 @@ class TelemetryFrame:
     state: str
     near_player_box: Optional[Tuple[int, int, int, int]] = None
     near_player_world: Optional[Tuple[float, float]] = None
+    far_player_box: Optional[Tuple[int, int, int, int]] = None   # far-side player (ACTIVE)
     toss_ball_candidates: List[dict] = None
     active_ball_candidates: List[dict] = None
     trophy_score: float = 0.0          # Probability of trophy/serve pose (ARMED state)
@@ -51,6 +48,9 @@ class AnyaTelemetryProvider:
         self.ball_model   = YOLO("weights/ball/weights/best.pt")
         self.trophy_model = YOLO(Config.DEFAULT_NEAR_TROPHY_MODEL_PATH)
 
+        # Define the cache path
+        self.active_zone_cache_path = "active_zone_config.json"
+
         # 1. Initialize Court Geometry (at 960x540 resolution)
         self.court_vertices, self.frame_shape = init_court(
             self.video_path,
@@ -61,7 +61,12 @@ class AnyaTelemetryProvider:
         self.H = self._compute_homography()
 
         # 3. Compute the active-zone polygon from court vertices (used in ACTIVE state)
-        self.active_zone_polygon = self._compute_active_zone_polygon()
+        self.active_zone_polygon = self._get_or_define_active_zone()
+
+        # 3b. Precompute baseline y-coordinates (pixel space) for near/far player classification
+        BL, BR, TR, TL = self.court_vertices
+        self._near_baseline_y  = (BL[1] + BR[1]) / 2.0
+        self._far_baseline_y   = (TR[1] + TL[1]) / 2.0
 
         # 4. Compute static exclusion zones from full video scan (one-time at startup)
         print("\n[INFO] Scanning video for static exclusion zones...")
@@ -97,8 +102,16 @@ class AnyaTelemetryProvider:
         self.frame_counter = 0
         buffer_size = int(self.fps * Config.TELEMETRY_BUFFER_SECONDS)
         self.telemetry_history = deque(maxlen=buffer_size)
-        
-        
+
+        # Cached player boxes for ACTIVE-state striding (player tracked every N frames)
+        self.ACTIVE_PLAYER_STRIDE = 4
+        self._cached_player_boxes: Tuple = (None, None, None)  # (near_box, near_world, far_box)
+
+        # Trophy model stride (run every N frames in ARMED state)
+        self.ARMED_TROPHY_STRIDE = 2
+        self._last_trophy_score: float = 0.0
+
+
         # MediaPipe Pose for ACTIVE state
         """
         self.mp_pose = mp_pose
@@ -109,6 +122,67 @@ class AnyaTelemetryProvider:
             min_detection_confidence=0.5
         )
         """
+    
+
+    def _get_or_define_active_zone(self) -> np.ndarray:
+        """Loads cached polygon or triggers interactive UI to define 8 points."""
+        if os.path.exists(self.active_zone_cache_path):
+            try:
+                with open(self.active_zone_cache_path, 'r') as f:
+                    points = json.load(f)
+                print(f"[INFO] Loaded 8-sided active zone from {self.active_zone_cache_path}")
+                return np.array(points, dtype=np.int32)
+            except Exception as e:
+                print(f"[WARN] Failed to load cached polygon: {e}")
+
+        # If no cache exists, run the interactive selector
+        print("[INFO] Defining new 8-sided active zone. Click 8 points on the frame.")
+        points = self._interactive_polygon_selector()
+        
+        # Cache the points
+        with open(self.active_zone_cache_path, 'w') as f:
+            json.dump(points.tolist(), f)
+        
+        return points
+
+    def _interactive_polygon_selector(self) -> np.ndarray:
+        """OpenCV window to collect exactly 8 points from the user."""
+        cap = cv2.VideoCapture(self.video_path)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            raise RuntimeError("Could not read frame for polygon definition.")
+
+        # Resample to analysis size
+        frame = cv2.resize(frame, (960, 540))
+        display_frame = frame.copy()
+        selected_points = []
+
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN and len(selected_points) < 8:
+                selected_points.append((x, y))
+                # Draw point and line to previous point
+                cv2.circle(display_frame, (x, y), 5, (0, 255, 0), -1)
+                if len(selected_points) > 1:
+                    cv2.line(display_frame, selected_points[-2], selected_points[-1], (0, 255, 0), 2)
+                if len(selected_points) == 8:
+                    cv2.line(display_frame, selected_points[-1], selected_points[0], (0, 255, 0), 2)
+                cv2.imshow("Define 8-Sided Active Zone", display_frame)
+
+        cv2.namedWindow("Define 8-Sided Active Zone")
+        cv2.setMouseCallback("Define 8-Sided Active Zone", mouse_callback)
+
+        print("Instructions: Click 8 points to define the zone. Press 'q' to confirm once finished.")
+        
+        while True:
+            cv2.imshow("Define 8-Sided Active Zone", display_frame)
+            key = cv2.waitKey(1) & 0xFF
+            if (key == ord('q') or key == 27) and len(selected_points) == 8:
+                break
+        
+        cv2.destroyWindow("Define 8-Sided Active Zone")
+        return np.array(selected_points, dtype=np.int32)
 
     def _init_video_props(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -217,25 +291,50 @@ class AnyaTelemetryProvider:
         return x1 <= ball_cx <= x2 and y1 <= ball_cy <= y2
 
     def _track_near_player(self, frame):
-        results = self.player_model(frame, verbose=False, conf=0.5, imgsz=Config.PLAYER_IMGSZ)
-        best_box, best_world = None, None
-        min_dist = float('inf')
+        """
+        Detect all players and return the near player (closest to near baseline in
+        world space) and the far player (any other detection whose pixel-space feet
+        y2 is closer to the far baseline than to the near baseline).
 
-        if results and results[0].boxes:
-            for b in results[0].boxes:
-                if int(b.cls[0]) == Config.DEFAULT_PLAYER_CLASS_INDEX:
-                    x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                    cx, y_feet = (x1 + x2) / 2.0, y2
-                    wx, wy = self.get_world_pos(cx, y_feet)
-                    
-                    # Assuming camera is on back fence, player is near baseline (y <= 0)
-                    dist_to_baseline = abs(wy) 
-                    if dist_to_baseline < min_dist:
-                        min_dist = dist_to_baseline
-                        best_box = (x1, y1, x2, y2)
-                        best_world = (wx, wy)
-                        
-        return best_box, best_world
+        Returns (near_box, near_world, far_box).
+        """
+        results = self.player_model(frame, verbose=False, conf=0.5, imgsz=Config.PLAYER_IMGSZ)
+        near_box, near_world = None, None
+        far_box = None
+        min_near_dist = float('inf')
+        min_far_dist  = float('inf')
+
+        if not (results and results[0].boxes):
+            return None, None, None
+
+        # First pass — find the near player (smallest world-space distance to near baseline)
+        for b in results[0].boxes:
+            if int(b.cls[0]) != Config.DEFAULT_PLAYER_CLASS_INDEX:
+                continue
+            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+            cx = (x1 + x2) / 2.0
+            wx, wy = self.get_world_pos(cx, y2)
+            dist = abs(wy)
+            if dist < min_near_dist:
+                min_near_dist = dist
+                near_box   = (x1, y1, x2, y2)
+                near_world = (wx, wy)
+
+        # Second pass — find the far player: any detection (excluding the near player)
+        # whose feet (y2) are closer to the far baseline than to the near baseline
+        for b in results[0].boxes:
+            if int(b.cls[0]) != Config.DEFAULT_PLAYER_CLASS_INDEX:
+                continue
+            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+            if near_box and (x1, y1, x2, y2) == near_box:
+                continue
+            dist_to_near = abs(y2 - self._near_baseline_y)
+            dist_to_far  = abs(y2 - self._far_baseline_y)
+            if dist_to_far < dist_to_near and dist_to_far < min_far_dist:
+                min_far_dist = dist_to_far
+                far_box = (x1, y1, x2, y2)
+
+        return near_box, near_world, far_box
 
     def process_frame(self, frame) -> TelemetryFrame:
         self.frame_counter += 1
@@ -249,10 +348,20 @@ class AnyaTelemetryProvider:
             active_ball_candidates=[]
         )
 
-        # 1. ALWAYS track near side player
-        p_box, p_world = self._track_near_player(frame)
-        telemetry.near_player_box = p_box
+        # 1. Track near/far player.
+        # In ACTIVE state, run the player model every ACTIVE_PLAYER_STRIDE frames and
+        # hold the cached result in between — the player position changes slowly and
+        # the box is only used for ball-detection filtering and the near-player timer.
+        if (self.current_state == "ACTIVE"
+                and self.frame_counter % self.ACTIVE_PLAYER_STRIDE != 0
+                and self._cached_player_boxes[0] is not None):
+            p_box, p_world, far_box = self._cached_player_boxes
+        else:
+            p_box, p_world, far_box = self._track_near_player(frame)
+            self._cached_player_boxes = (p_box, p_world, far_box)
+        telemetry.near_player_box   = p_box
         telemetry.near_player_world = p_world
+        telemetry.far_player_box    = far_box
 
         # 2. ARMED State — buffer frames for dynamic exclusion zone computation (0-0.5s window)
         if self.current_state == "ARMED":
@@ -290,18 +399,21 @@ class AnyaTelemetryProvider:
             pw, ph = nx2 - nx1, ny2 - ny1
             fh, fw = frame.shape[:2]
 
-            # Trophy pose classification
-            pad_x = int(pw * Config.DEFAULT_TROPHY_PAD)
-            pad_y = int(ph * Config.DEFAULT_TROPHY_PAD)
-            tx1 = max(0, nx1 - pad_x); ty1 = max(0, ny1 - pad_y)
-            tx2 = min(fw, nx2 + pad_x); ty2 = min(fh, ny2 + pad_y)
-            trophy_crop = frame[ty1:ty2, tx1:tx2]
-            if trophy_crop.size > 0:
-                tr = self.trophy_model(trophy_crop, verbose=False, imgsz=Config.TROPHY_IMGSZ)
-                if tr and hasattr(tr[0], "probs") and tr[0].probs is not None:
-                    idx = Config.DEFAULT_NEAR_TROPHY_CLASS_INDEX
-                    if idx < len(tr[0].probs.data):
-                        telemetry.trophy_score = float(tr[0].probs.data[idx])
+            # Trophy pose classification — run every ARMED_TROPHY_STRIDE frames,
+            # carry forward the last score in between (pose changes slowly).
+            if self.frame_counter % self.ARMED_TROPHY_STRIDE == 0:
+                pad_x = int(pw * Config.DEFAULT_TROPHY_PAD)
+                pad_y = int(ph * Config.DEFAULT_TROPHY_PAD)
+                tx1 = max(0, nx1 - pad_x); ty1 = max(0, ny1 - pad_y)
+                tx2 = min(fw, nx2 + pad_x); ty2 = min(fh, ny2 + pad_y)
+                trophy_crop = frame[ty1:ty2, tx1:tx2]
+                if trophy_crop.size > 0:
+                    tr = self.trophy_model(trophy_crop, verbose=False, imgsz=Config.TROPHY_IMGSZ)
+                    if tr and hasattr(tr[0], "probs") and tr[0].probs is not None:
+                        idx = Config.DEFAULT_NEAR_TROPHY_CLASS_INDEX
+                        if idx < len(tr[0].probs.data):
+                            self._last_trophy_score = float(tr[0].probs.data[idx])
+            telemetry.trophy_score = self._last_trophy_score
 
             # Toss ball detection — ROI above player box
             rx1 = max(0,  int(nx1 - pw / 2))
@@ -310,7 +422,7 @@ class AnyaTelemetryProvider:
             ry2 = min(fh, int(ny1 + ph / 2))
             roi = frame[ry1:ry2, rx1:rx2]
             if roi.size > 0:
-                ball_res = self.ball_model(roi, verbose=False, conf=0.10,
+                ball_res = self.ball_model(roi, verbose=False, conf=Config.TOSS_BALL_CONF,
                                            imgsz=Config.TOSS_BALL_IMGSZ)
                 if ball_res and ball_res[0].boxes:
                     for b in ball_res[0].boxes:
@@ -350,17 +462,24 @@ class AnyaTelemetryProvider:
                     telemetry.pose_landmarks = pose_results.pose_landmarks
                     """
 
-            # Whole-court ball detection — include world coordinates for energy system
-            ball_res = self.ball_model(frame, verbose=False, conf=0.10, imgsz=Config.BALL_IMGSZ)
+            # Whole-court ball detection (plain YOLO — no internal tracker).
+            # Track IDs are assigned downstream by the custom trajectory-coherent
+            # tracker inside TransitionEngine._update_ball_tracks().
+            ball_res = self.ball_model(
+                frame, verbose=False, conf=Config.ACTIVE_BALL_CONF, imgsz=Config.BALL_IMGSZ,
+            )
+
             if ball_res and ball_res[0].boxes:
                 for b in ball_res[0].boxes:
                     bx1, by1, bx2, by2 = b.xyxy[0].tolist()
                     bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
 
-                    # Filter: must be inside active-zone polygon, outside exclusion zones, outside player box
+                    # Filter: must be inside active-zone polygon, outside exclusion zones,
+                    # outside near player box (15px), and outside far player box (10px)
                     if (self._is_in_active_zone(bcx, bcy) and
                             not _is_in_exclusion_zone(bcx, bcy, self.exclusion_zones) and
-                            not self._is_in_player_box(bcx, bcy, p_box, padding=15)):
+                            not self._is_in_player_box(bcx, bcy, p_box, padding=15) and
+                            not self._is_in_player_box(bcx, bcy, far_box, padding=10)):
                         world_x, world_y = self.get_world_pos(bcx, bcy)
                         telemetry.active_ball_candidates.append({
                             "box":          (bx1, by1, bx2, by2),
@@ -368,6 +487,7 @@ class AnyaTelemetryProvider:
                             "world_x":      world_x,
                             "world_y":      world_y,
                             "pixel_center": (bcx, bcy),
+                            "track_id":     -1,   # assigned by TransitionEngine
                         })
 
         # Append to buffer
@@ -385,4 +505,5 @@ class AnyaTelemetryProvider:
             self._armed_frame_buffer     = []
             self._armed_entry_time       = now
             self._armed_collection_done  = False
+            self._last_trophy_score      = 0.0   # don't carry score from previous ARMED entry
             print("[INFO] ARMED entered — starting dynamic exclusion zone collection (0-0.5s)")

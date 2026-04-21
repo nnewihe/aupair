@@ -1,61 +1,162 @@
+import argparse
+import csv
+import os
+
 import cv2
 import numpy as np
-from src.ai.anya_base import AnyaTelemetryProvider
+
+from src.ai.anya_base import AnyaTelemetryProvider, TelemetryFrame
 from src.ai.anya_transitions import TransitionEngine
 
-def run_anya_pipeline(video_path):
-    # 1. Initialize the components
-    # This will trigger the interactive court selection (init_court) 
-    # and analyze frame 300 for exclusion zones.
+
+def run_anya_pipeline(video_path, output_path="output.mp4", headless=False, start_frame=0):
+    # ── Probe original video properties ───────────────────────────────────
+    _probe = cv2.VideoCapture(video_path)
+    orig_w   = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h   = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    orig_fps = _probe.get(cv2.CAP_PROP_FPS)
+    _probe.release()
+    if orig_fps <= 0 or orig_fps > 300:
+        orig_fps = 30.0
+
+    # ── Initialize pipeline components ────────────────────────────────────
+    # AnyaTelemetryProvider triggers interactive court selection on init.
     telemetry_provider = AnyaTelemetryProvider(video_path)
-    
-    # Initialize the transition engine with the video's FPS
     engine = TransitionEngine(fps=telemetry_provider.fps)
-    
-    cap = cv2.VideoCapture(video_path)
-    
+
+    # ── Output video writer (clean original footage, ACTIVE frames only) ──
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, orig_fps, (orig_w, orig_h))
+
+    # ── CSV telemetry writer ───────────────────────────────────────────────
+    csv_path = os.path.splitext(output_path)[0] + "_telemetry.csv"
+    _CSV_COLS = [
+        "point", "frame", "timestamp", "state",
+        "time_since_trace", "has_active_trace",
+        "energy_bar_mode", "point_energy", "energy_status",
+        "ball_count", "window_max_speed",
+    ]
+    csv_file   = open(csv_path, "w", newline="")
+    csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_COLS)
+    csv_writer.writeheader()
+
+    # ── Main loop ──────────────────────────────────────────────────────────
+    cap           = cv2.VideoCapture(video_path)
+    point_number  = 0
+    frame_in_point = 0
+
+    # Seek to start frame if specified
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        print(f"[DEBUG] Seeking to frame {start_frame}")
+
+    # --- Updated section within run_anya_pipeline (run_anya.py) ---
+
+    WAITING_STRIDE = 3
+
     while cap.isOpened():
-        success, frame = cap.read()
+        success, orig_frame = cap.read()
         if not success:
             break
 
-        # Resample frame to 960x540
-        frame = cv2.resize(frame, (960, 540), interpolation=cv2.INTER_LINEAR)
+        # Resize here so `frame` is always defined for the debug display below
+        frame = cv2.resize(orig_frame, (960, 540), interpolation=cv2.INTER_LINEAR)
 
-        # 2. Process the frame to get telemetry
-        # This runs the appropriate detectors based on the current state
-        telemetry = telemetry_provider.process_frame(frame)
-
-        # 3. Evaluate transitions using the 5-second buffer
-        # We pass the rolling history and current state to the engine
-        new_state = engine.evaluate_transitions(
-            telemetry_provider.telemetry_history, 
-            telemetry_provider.current_state
+        skip_inference = (
+            telemetry_provider.current_state == "WAITING"
+            and telemetry_provider.frame_counter % WAITING_STRIDE != 0
+            and bool(telemetry_provider.telemetry_history)
         )
-        
-        # 4. Update the provider's state if a transition occurred
+
+        if skip_inference:
+            # Advance the counter so timestamps stay continuous
+            telemetry_provider.frame_counter += 1
+            last = telemetry_provider.telemetry_history[-1]
+            telemetry = TelemetryFrame(
+                frame_id=telemetry_provider.frame_counter,
+                timestamp=telemetry_provider.frame_counter / telemetry_provider.fps,
+                state="WAITING",
+                near_player_box=last.near_player_box,
+                near_player_world=last.near_player_world,
+                toss_ball_candidates=[],
+                active_ball_candidates=[],
+            )
+            telemetry_provider.telemetry_history.append(telemetry)
+        else:
+            telemetry = telemetry_provider.process_frame(frame)
+
+        new_state = engine.evaluate_transitions(
+            telemetry_provider.telemetry_history,
+            telemetry_provider.current_state,
+        )
+
         if new_state != telemetry_provider.current_state:
+            if new_state == "ACTIVE":
+                point_number += 1
+                frame_in_point = 0
             telemetry_provider.update_state(new_state)
 
-        # 5. Optional: Visualization for debugging
-        render_frame(frame, telemetry, telemetry_provider.current_state, engine,
-                     telemetry_provider.exclusion_zones,
-                     telemetry_provider.active_zone_polygon)
+        current_state = telemetry_provider.current_state
 
-        # 6. Debug panel in separate window
-        debug_panel = render_debug_panel(telemetry_provider.current_state, engine, telemetry_provider)
-
-        cv2.imshow("Anya Pipeline", frame)
-        cv2.imshow("Debug Panel", debug_panel)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # -- Write output video & CSV during ACTIVE --
+        if current_state == "ACTIVE":
+            # LABEL THE POINT NUMBER ON THE ORIGINAL FRAME
+            cv2.putText(orig_frame, f"Point {point_number}", (50, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 0), 4, cv2.LINE_AA)
             
+            writer.write(orig_frame)
+            frame_in_point += 1
+            _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point)
+
+        # ── Debug visualisation (skipped when headless) ────────────────────
+        if not headless:
+            render_frame(frame, telemetry, current_state, engine,
+                         telemetry_provider.exclusion_zones,
+                         telemetry_provider.active_zone_polygon)
+            debug_panel = render_debug_panel(current_state, engine, telemetry_provider)
+            cv2.imshow("Anya Pipeline", frame)
+            cv2.imshow("Debug Panel", debug_panel)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    # ── Cleanup ────────────────────────────────────────────────────────────
     cap.release()
-    cv2.destroyAllWindows()
+    writer.release()
+    csv_file.close()
+    if not headless:
+        cv2.destroyAllWindows()
+
+    print(f"\n[DONE] Output video  : {output_path}")
+    print(f"[DONE] Telemetry CSV : {csv_path}")
+    print(f"[DONE] Points recorded: {point_number}")
+
+
+# ── CSV helper ─────────────────────────────────────────────────────────────
+
+def _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point):
+    """Write pure telemetry state and active transition data."""
+    debug = engine.last_active_debug
+    
+    csv_writer.writerow({
+        "point":            point_number,
+        "frame":            frame_in_point,
+        "timestamp":        round(telemetry.timestamp, 4),
+        "state":            telemetry.state,
+        "time_since_trace": round(debug.get("time_since_trace", 0.0), 3),
+        "has_active_trace": debug.get("has_active_trace", False),
+        "energy_bar_mode":  debug.get("energy_bar_mode", False),
+        "point_energy":     round(debug.get("point_energy", 1.0), 3),
+        "energy_status":    debug.get("energy_status", ""),
+        "ball_count":       debug.get("ball_count", 0),
+        "window_max_speed": round(debug.get("window_max_speed_fts", 0.0), 3),
+    })
+
+
+# ── Debug visualisation ────────────────────────────────────────────────────
 
 def render_frame(frame, telemetry, state, engine=None, exclusion_zones=None,
                  active_zone_polygon=None):
-    """Debug overlay — state badge, player box, balls, exclusion zones, and active polygon."""
+    """Debug overlay — state badge, player boxes, balls, exclusion zones, and active polygon."""
 
     # Draw translucent light-green active-zone polygon in ACTIVE state
     if state == "ACTIVE" and active_zone_polygon is not None:
@@ -68,9 +169,17 @@ def render_frame(frame, telemetry, state, engine=None, exclusion_zones=None,
     cv2.putText(frame, f"STATE: {state}", (50, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
+    # Near player — blue box
     if telemetry.near_player_box:
         x1, y1, x2, y2 = telemetry.near_player_box
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+    # Far player — pink box (ACTIVE only)
+    if state == "ACTIVE" and telemetry.far_player_box:
+        x1, y1, x2, y2 = telemetry.far_player_box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 105, 255), 2)   # pink (BGR)
+        cv2.putText(frame, "FAR", (x1, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 105, 255), 1, cv2.LINE_AA)
 
     # Draw red bounding boxes for exclusion zones
     if exclusion_zones:
@@ -88,23 +197,36 @@ def render_frame(frame, telemetry, state, engine=None, exclusion_zones=None,
             bx1, by1, bx2, by2 = ball["box"]
             cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
 
-    if state == "ACTIVE" and telemetry.active_ball_candidates:
-        for ball in telemetry.active_ball_candidates:
-            bx1, by1, bx2, by2 = ball["box"]
-            cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
+    if state == "ACTIVE" and engine is not None:
+        # ── Ball trace (fading orange trail) ──────────────────────────────
+        trace = list(engine._ball_trace_pixels)
+        n = len(trace)
+        if n >= 2:
+            for i in range(1, n):
+                age = i / (n - 1)          # 0 = oldest segment end, 1 = newest
+                color = (0, int(120 * age), int(255 * age))   # dark → orange (BGR)
+                thickness = max(1, int(3 * age))
+                pt1 = (int(trace[i - 1][0]), int(trace[i - 1][1]))
+                pt2 = (int(trace[i][0]),     int(trace[i][1]))
+                cv2.line(frame, pt1, pt2, color, thickness, cv2.LINE_AA)
+        if n >= 1:
+            tip = (int(trace[-1][0]), int(trace[-1][1]))
+            cv2.circle(frame, tip, 5, (0, 200, 255), -1, cv2.LINE_AA)   # bright orange dot
 
-    if (state == "ACTIVE"
-            and engine is not None
-            and telemetry.player_crop_rect is not None):
-        cx1, cy1, cx2, cy2 = telemetry.player_crop_rect
-        # engine._gait_analyzer.draw_debug(frame, cx1, cy1, cx2, cy2)
+        # ── Current-frame ball detections ─────────────────────────────────
+        if telemetry.active_ball_candidates:
+            for ball in telemetry.active_ball_candidates:
+                bx1, by1, bx2, by2 = ball["box"]
+                cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)),
+                              (0, 255, 255), 2)   # cyan box around live detection
+
 
 def render_debug_panel(state, engine, telemetry_provider):
     """
-    Create a debug visualization panel showing energy and serve scores.
+    Create a debug visualization panel showing timeout status and serve scores.
     Returns an image to display in a separate window.
     """
-    panel_width, panel_height = 400, 350
+    panel_width, panel_height = 500, 300
     panel = np.ones((panel_height, panel_width, 3), dtype=np.uint8) * 240  # Light gray bg
 
     if state == "ACTIVE":
@@ -112,148 +234,129 @@ def render_debug_panel(state, engine, telemetry_provider):
     elif state == "ARMED":
         render_armed_debug(panel, engine)
     else:
-        # WAITING state
-        cv2.putText(panel, "WAITING", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        cv2.putText(panel, "WAITING FOR PLAYER", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 80), 1)
 
     return panel
 
+
 def render_active_debug(panel, engine):
-    """Render energy bar, player and ball contributions during ACTIVE state."""
-    # Title
-    cv2.putText(panel, "ACTIVE - Energy", (10, 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+    """
+    Visualizes the hybrid ball-trace / energy-bar state for ACTIVE -> WAITING.
+    """
+    x0, y, lh = 15, 35, 30
+    fs = 0.5
 
-    # Current energy bar
-    energy_bar_y = 22
-    bar_width = 120
-    bar_height = 12
-    bar_x = 10
+    cv2.putText(panel, "ACTIVE — BALL TRACE / ENERGY BAR", (x0, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 2)
 
-    # Draw background bar
-    cv2.rectangle(panel, (bar_x, energy_bar_y), (bar_x + bar_width, energy_bar_y + bar_height),
-                  (200, 200, 200), -1)
+    d = engine.last_active_debug
 
-    # Draw energy fill
-    energy_fill = int(engine.point_energy * bar_width)
-    cv2.rectangle(panel, (bar_x, energy_bar_y), (bar_x + energy_fill, energy_bar_y + bar_height),
-                  (0, 200, 255), -1)  # Cyan
+    # 1. Active ball trace
+    has_trace = d.get("has_active_trace", False)
+    tst       = d.get("time_since_trace", 0.0)
+    trace_color = (0, 180, 0) if has_trace else (0, 0, 200)
+    trace_label = "YES" if has_trace else f"NO  ({tst:.1f}s ago)"
+    cv2.putText(panel, f"Active Trace: {trace_label}",
+                (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, trace_color, 1)
+    y += lh
 
-    # Energy value text
-    cv2.putText(panel, f"{engine.point_energy:.2f}", (bar_x + bar_width + 5, energy_bar_y + 11),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
+    # 1b. Net kill indicator
+    in_net = d.get("ball_in_net", False)
+    if in_net:
+        cv2.putText(panel, "BALL IN NET — IMMEDIATE KILL",
+                    (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), 2)
+        y += lh
 
-    # Individual contributions
-    deltas = engine.last_energy_deltas
-    y_offset = 42
-    line_height = 13
-    bar_x = 10
-    bar_width = 80
-    bar_height = 7
+    # 2. Energy bar (shown when active, greyed out when trace is present)
+    energy_mode = d.get("energy_bar_mode", False)
+    energy      = d.get("point_energy", 1.0)
+    status      = d.get("energy_status", "--")
 
-    # Player contributions
-    player_scale = deltas.get("player_scale", 1.0)
-    player_contributions = [
-        ("Spr", deltas.get("sprint_delta", 0.0)),
-        ("Act", deltas.get("action_delta", 0.0)),
-        ("Wlk", deltas.get("walk_delta", 0.0)),
-        ("Gai", deltas.get("gait_delta", 0.0)),
-        ("Mis", deltas.get("missing_delta", 0.0)),
-        ("Var", deltas.get("variance_delta", 0.0)),
-    ]
+    bar_label = "ENERGY BAR" if energy_mode else "Energy (dormant)"
+    bar_color = (0, 180, 0) if not energy_mode else (
+        (0, 0, 220) if energy < 0.3 else (0, 165, 255) if energy < 0.6 else (0, 200, 0)
+    )
+    cv2.putText(panel, f"{bar_label}: {energy:.2f}  [{status}]",
+                (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, bar_color, 2 if energy_mode else 1)
+    y += 6
 
-    for label, delta in player_contributions:
-        scaled_delta = delta * player_scale
-        color = (0, 255, 0) if scaled_delta > 0 else (0, 0, 255)
+    # Energy bar graphic (only meaningful in energy bar mode)
+    bar_w   = 200
+    bar_x   = x0
+    bar_y   = y
+    bg_col  = (180, 180, 180) if not energy_mode else (100, 100, 100)
+    cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + 14), bg_col, -1)
+    if energy_mode and energy > 0:
+        fill_col = (0, 0, 220) if energy < 0.3 else (0, 165, 255) if energy < 0.6 else (0, 200, 0)
+        cv2.rectangle(panel, (bar_x, bar_y), (bar_x + int(energy * bar_w), bar_y + 14), fill_col, -1)
+    y += 24
 
-        if abs(scaled_delta) > 0.0001:
-            bar_len = max(1, int(min(abs(scaled_delta) * 400, bar_width)))
-            cv2.rectangle(panel, (bar_x, y_offset), (bar_x + bar_len, y_offset + bar_height),
-                          color, -1)
+    # 3. Ball count / speed
+    ball_count = d.get("ball_count", 0)
+    speed      = d.get("window_max_speed_fts", 0.0)
+    cv2.putText(panel, f"Balls: {ball_count}   Max speed: {speed:.1f} ft/s",
+                (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (80, 80, 80), 1)
 
-        cv2.putText(panel, f"{label}:{scaled_delta:+.2f}", (bar_x, y_offset + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (0, 0, 0), 1)
-        y_offset += line_height
-
-    # Ball contributions
-    y_offset += 4
-    ball_scale = deltas.get("ball_scale", 1.0)
-    ball_contributions = [
-        ("Fast", deltas.get("ball_fast_delta", 0.0)),
-        ("Roll", deltas.get("ball_rolling_delta", 0.0)),
-        ("Occ", deltas.get("ball_occluded_delta", 0.0)),
-        ("Dead", deltas.get("ball_dead_delta", 0.0)),
-        ("AZone", deltas.get("ball_action_zone_delta", 0.0)),
-    ]
-
-    for label, delta in ball_contributions:
-        scaled_delta = delta * ball_scale
-        color = (0, 255, 0) if scaled_delta > 0 else (0, 0, 255)
-
-        if abs(scaled_delta) > 0.0001:
-            bar_len = max(1, int(min(abs(scaled_delta) * 400, bar_width)))
-            cv2.rectangle(panel, (bar_x, y_offset), (bar_x + bar_len, y_offset + bar_height),
-                          color, -1)
-
-        cv2.putText(panel, f"{label}:{scaled_delta:+.2f}", (bar_x, y_offset + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (0, 0, 0), 1)
-        y_offset += line_height
 
 def render_armed_debug(panel, engine):
     """Render serve scores during ARMED state."""
-    # Title
-    cv2.putText(panel, "ARMED - Serve Scores", (10, 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+    x0      = 12
+    bar_w   = 200
+    bar_h   = 14
+    lh      = 30
+    label_w = 110
+
+    cv2.putText(panel, "ARMED  —  Serve Detection", (x0, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
 
     scores = engine.last_serve_scores
-    trophy = scores.get("trophy_score", 0.0)
-    toss = scores.get("toss_score", 0.0)
-    serve = scores.get("serve_score", 0.0)
+    rows = [
+        ("Trophy Score", scores.get("trophy_score", 0.0), (0, 120, 255)),
+        ("Toss Score",   scores.get("toss_score",   0.0), (0, 200, 200)),
+        ("Serve Score",  scores.get("serve_score",  0.0), None),
+    ]
 
-    # Score bars
-    y_offset = 32
-    bar_width = 120
-    bar_height = 10
-    bar_x = 10
-    line_height = 22
+    y = 65
+    for label, value, color in rows:
+        if color is None:
+            color = (0, 220, 0) if value >= 0.55 else (0, 140, 255)
+        cv2.putText(panel, f"{label}:", (x0, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
+        bx = x0 + label_w
+        cv2.rectangle(panel, (bx, y - bar_h + 2), (bx + bar_w, y + 2), (190, 190, 190), -1)
+        cv2.rectangle(panel, (bx, y - bar_h + 2), (bx + int(value * bar_w), y + 2), color, -1)
+        cv2.putText(panel, f"{value:.3f}", (bx + bar_w + 6, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        if label == "Serve Score":
+            thresh_x = bx + int(0.55 * bar_w)
+            cv2.line(panel, (thresh_x, y - bar_h + 2), (thresh_x, y + 2), (0, 0, 0), 2)
+        y += lh
 
-    # Trophy score
-    cv2.putText(panel, "Trophy:", (bar_x, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.rectangle(panel, (bar_x + 50, y_offset - 8), (bar_x + 50 + bar_width, y_offset - 8 + bar_height),
-                  (200, 200, 200), -1)
-    trophy_fill = int(trophy * bar_width)
-    cv2.rectangle(panel, (bar_x + 50, y_offset - 8), (bar_x + 50 + trophy_fill, y_offset - 8 + bar_height),
-                  (255, 165, 0), -1)  # Orange
-    cv2.putText(panel, f"{trophy:.2f}", (bar_x + 50 + bar_width + 5, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-
-    y_offset += line_height
-
-    # Toss score
-    cv2.putText(panel, "Toss:", (bar_x, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.rectangle(panel, (bar_x + 50, y_offset - 8), (bar_x + 50 + bar_width, y_offset - 8 + bar_height),
-                  (200, 200, 200), -1)
-    toss_fill = int(toss * bar_width)
-    cv2.rectangle(panel, (bar_x + 50, y_offset - 8), (bar_x + 50 + toss_fill, y_offset - 8 + bar_height),
-                  (0, 200, 200), -1)  # Cyan
-    cv2.putText(panel, f"{toss:.2f}", (bar_x + 50 + bar_width + 5, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-
-    y_offset += line_height
-
-    # Combined serve score
-    cv2.putText(panel, "Serve:", (bar_x, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
-    cv2.rectangle(panel, (bar_x + 50, y_offset - 8), (bar_x + 50 + bar_width, y_offset - 8 + bar_height),
-                  (200, 200, 200), -1)
-    serve_fill = int(serve * bar_width)
-    color = (0, 255, 0) if serve >= 0.55 else (0, 165, 255)  # Green if above threshold, orange otherwise
-    cv2.rectangle(panel, (bar_x + 50, y_offset - 8), (bar_x + 50 + serve_fill, y_offset - 8 + bar_height),
-                  color, -1)
-    cv2.putText(panel, f"{serve:.2f}", (bar_x + 50 + bar_width + 5, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
 
 if __name__ == "__main__":
-    run_anya_pipeline("/Users/tennis/Desktop/snippet.mp4")
+    parser = argparse.ArgumentParser(
+        description="Anya Tennis Point Detection Pipeline"
+    )
+    parser.add_argument(
+        "input",
+        help="Path to input video file",
+    )
+    parser.add_argument(
+        "--output",
+        default="output.mp4",
+        help="Path to output MP4 file (default: output.mp4)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without displaying video windows",
+    )
+    parser.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+        help="Start processing from this frame number (default: 0)",
+    )
+    args = parser.parse_args()
+    run_anya_pipeline(args.input, args.output, args.headless, args.start_frame)
