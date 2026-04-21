@@ -59,28 +59,25 @@ class TransitionEngine:
         # ACTIVE — Ball trace detection
         # ------------------------------------------------------------------
         self.BALL_TIMEOUT             = 2.5   # seconds — DBSCAN history window
-        self.BALL_DEAD_SPEED_FTS      = 3.0   # ft/s — "stationary" threshold (DBSCAN + trace filter)
+        self.BALL_DEAD_SPEED_FTS      = 6.0   # ft/s — "stationary" threshold (DBSCAN + trace filter)
         self.BALL_DEAD_CLUSTER_EPS_FT = 3.0   # ft  — DBSCAN eps
         self.FAST_BALL_THRESHOLD_FTS  = 15.0  # ft/s — serve/groundstroke speed
         self.EXTENDED_TIMEOUT_SEC     = 4.0   # extra grace for fast balls
         self.MAX_BALL_SPEED_FTS       = 176.0 # ft/s — physical upper bound (≈120 mph serve)
-        # Net kill
-        self.NET_Y_FT                 = 39.0  # ft — net cord (midpoint of 78ft court)
-        self.NET_ZONE_HALF_WIDTH_FT   = 2.5   # ft — ±2.5ft either side of net cord
+        self.BALL_SPEED_WINDOW_SEC    = 0.15  # seconds — displacement window for speed smoothing
 
         # ------------------------------------------------------------------
         # ACTIVE — Energy bar constants (adapted from near_anya.py Config)
         # ------------------------------------------------------------------
-        self.ENERGY_BOOST_SPRINT            = 4.0   # energy/second while sprinting
-        self.ENERGY_BOOST_SWING             = 4.0   # energy/second during swing/split-step
-        self.ENERGY_DECAY_WALKING           = 0.4  # energy/second drain while walking
-        self.ENERGY_DECAY_MISSING           = 0.4   # energy/second drain when player not detected
-        self.ENERGY_DECAY_STILL             = 0.25  # energy/second drain while standing still
-        self.PLAYER_SPRINT_VELOCITY_THRESHOLD = 6.0  # px/frame (over window) → sprinting
-        self.PLAYER_STILL_VELOCITY_THRESHOLD  = 1.5  # px/frame (over window) → standing still
-        self.PLAYER_SPRINT_VELOCITY_PPS     = 90    # 90 px / second
-        self.SHAPE_CHANGE_THRESHOLD_PX        = 80.0 # px change in (width + height) → swing
-        self.VELOCITY_WINDOW_SIZE             = 20
+        self.ENERGY_BOOST_SPRINT          = 4.0  # energy/second while sprinting
+        self.ENERGY_BOOST_SWING           = 4.0  # energy/second during swing/split-step
+        self.ENERGY_DECAY_WALKING         = 0.25 # energy/second drain while walking
+        self.ENERGY_DECAY_MISSING         = 0.4  # energy/second drain when player not detected
+        self.ENERGY_DECAY_STILL           = 0.25 # energy/second drain while standing still
+        self.PLAYER_SPRINT_VELOCITY_FTS   = 7.0  # ft/s (world space) → sprinting
+        self.PLAYER_STILL_VELOCITY_FTS    = 1.5  # ft/s (world space) → standing still
+        self.VELOCITY_WINDOW_SIZE         = 20   # number of player position samples to smooth over
+        self.ACTIVE_PLAYER_STRIDE         = 4    # must match AnyaTelemetryProvider.ACTIVE_PLAYER_STRIDE
         # Walking gait detection
         self.GAIT_BUFFER_FRAMES  = 45
         self.GAIT_MIN_REVERSALS  = 2
@@ -141,6 +138,11 @@ class TransitionEngine:
         self._energy_gait_y_buffer:    deque = deque(maxlen=self.GAIT_BUFFER_FRAMES)
         self._player_missing_frames:   int   = 0
         self.PLAYER_MISSING_GRACE_FRAMES: int = 5
+        self.PLAYER_EMA_ALPHA:           float = 0.25  # EMA smoothing factor for world position
+                                                        # (lower = more smoothing)
+
+        # EMA-smoothed world position; reset to None on each ACTIVE exit
+        self._smoothed_player_world: Optional[Tuple[float, float]] = None
 
         # Ball trace — pixel centres of speed-validated detections (960×540 space)
         # maxlen ≈ 2s worth of frames; cleared on each ACTIVE exit
@@ -349,33 +351,39 @@ class TransitionEngine:
         # ---- 2. Update ball history (speed-filtered) ----
         # For each candidate:
         #   a) Reject if inter-frame speed exceeds MAX_BALL_SPEED_FTS (physically impossible).
-        #   b) Immediately kill the point if ball is in the net zone.
-        #   c) Only add pixel centre to the visual trace if ball is actually moving
+        #   b) Only add pixel centre to the visual trace if ball is actually moving
         #      (speed > BALL_DEAD_SPEED_FTS) — stationary detections are excluded from trace.
+        #   c) Track whether any candidate this frame is actually moving (for step 3).
+        any_moving = False
         for c in candidates:
             wx, wy = c.get("world_x", 0.0), c.get("world_y", 0.0)
             speed_fts = 0.0
 
-            if self._active_ball_world_history:
-                last_t, last_wx, last_wy = self._active_ball_world_history[-1]
-                dt_ball = now - last_t
-                if dt_ball > 0:
-                    speed_fts = math.hypot(wx - last_wx, wy - last_wy) / dt_ball
-                    if speed_fts > self.MAX_BALL_SPEED_FTS:
-                        continue  # implausible jump — discard
+            # Find the reference position from ~BALL_SPEED_WINDOW_SEC ago.
+            # Iterate newest→oldest through history; take the first entry that
+            # is both from a previous frame (t < now) and old enough to cover
+            # the smoothing window.  If history is shorter than the window, use
+            # whatever oldest entry is available — still better than one frame.
+            ref = None
+            for entry in reversed(self._active_ball_world_history):
+                if entry[0] >= now:
+                    continue        # same-frame entry — skip
+                ref = entry         # always keep updating so we have a fallback
+                if now - entry[0] >= self.BALL_SPEED_WINDOW_SEC:
+                    break           # old enough — use this as the reference
 
-            # (b) Net kill — ball detected in net zone
-            if abs(wy - self.NET_Y_FT) < self.NET_ZONE_HALF_WIDTH_FT:
-                print(f"\n[TRANSITION] ACTIVE -> WAITING (Ball in Net at wy={wy:.1f}ft). "
-                      f"Immediate kill.")
-                self.last_transition_time = now
-                self._reset_active_state()
-                return "WAITING"
+            if ref is not None:
+                ref_t, ref_wx, ref_wy = ref
+                dt_ball = now - ref_t
+                if dt_ball > 0:
+                    speed_fts = math.hypot(wx - ref_wx, wy - ref_wy) / dt_ball
+                    if speed_fts > self.MAX_BALL_SPEED_FTS:
+                        continue    # implausible displacement — discard
 
             self._active_ball_world_history.append((now, wx, wy))
 
-            # (c) Only trace moving ball detections
             if speed_fts > self.BALL_DEAD_SPEED_FTS:
+                any_moving = True
                 pc = c.get("pixel_center")
                 if pc is not None:
                     self._ball_trace_pixels.append(pc)
@@ -388,9 +396,13 @@ class TransitionEngine:
             self.last_ball_seen_time = now
 
         # ---- 3. Determine whether an active ball trace is present ----
-        # No candidates this frame → no trace, energy bar starts immediately.
-        # Candidates visible → run DBSCAN to check if they're stationary noise.
-        if not candidates:
+        # Fast path: no candidates, or all candidates are below BALL_DEAD_SPEED_FTS this
+        # frame → no active trace immediately, without waiting for DBSCAN to converge.
+        # This ensures a ball sitting still (e.g. in the net) is never counted as a live
+        # trace regardless of how long DBSCAN needs to classify the cluster.
+        # Slow path: at least one candidate is moving → fall back to DBSCAN to confirm
+        # it isn't part of a pre-existing stationary cluster.
+        if not candidates or not any_moving:
             has_active_trace = False
         else:
             stationary_clusters = self._get_stationary_clusters()
@@ -404,7 +416,6 @@ class TransitionEngine:
             "point_energy":         self.point_energy,
             "ball_count":           len(candidates),
             "window_max_speed_fts": self._window_max_speed(),
-            "ball_in_net":          False,  # updated above on net kill (before reaching here)
         }
 
         # ---- 5a. Active trace present → point is alive ----
@@ -455,19 +466,35 @@ class TransitionEngine:
     # ------------------------------------------------------------------
 
     def _update_player_tracking(self, frame) -> None:
-        """Append near-player box to rolling pixel-space buffers."""
-        near_box = frame.near_player_box
-        if near_box is None:
+        """Append near-player position (world space) and box (pixel space) to rolling buffers."""
+        near_box   = frame.near_player_box
+        near_world = frame.near_player_world
+        if near_box is None or near_world is None:
             self._player_missing_frames += 1
             self._energy_gait_y_buffer.clear()
             return
         self._player_missing_frames = 0
-        nx1, ny1, nx2, ny2 = near_box
-        cx     = (nx1 + nx2) / 2.0
-        cy_feet = float(ny2)
-        self._energy_player_positions.append((cx, cy_feet))
+
+        # World-space position: (world_x at box centre, world_y at box bottom)
+        # near_player_world is already computed from (pixel_cx, pixel_y2) in anya_base.py.
+        # Apply EMA to suppress perspective-foreshortening noise — the same pixel jitter
+        # maps to much larger world distances near the net than at the baseline.
+        wx, wy = near_world
+        if self._smoothed_player_world is None:
+            self._smoothed_player_world = (wx, wy)
+        else:
+            α = self.PLAYER_EMA_ALPHA
+            self._smoothed_player_world = (
+                α * wx + (1 - α) * self._smoothed_player_world[0],
+                α * wy + (1 - α) * self._smoothed_player_world[1],
+            )
+        self._energy_player_positions.append(self._smoothed_player_world)
+
+        # Pixel box retained for shape-change (swing) detection
         self._energy_player_boxes.append(near_box)
-        self._energy_gait_y_buffer.append(cy_feet)
+
+        # Gait: pixel-space feet y for oscillation detection
+        self._energy_gait_y_buffer.append(float(near_box[3]))
 
     def _compute_energy_delta(self, frame, dt: float):
         """
@@ -487,19 +514,23 @@ class TransitionEngine:
         if self._detect_walking_gait():
             return -(self.ENERGY_DECAY_WALKING * dt), "WALKING"
 
-        # Velocity in px/second (FPS-independent)
-        player_velocity_pps = 0.0
+        # Velocity in world-space ft/s, smoothed over VELOCITY_WINDOW_SIZE samples.
+        # Each sample is ACTIVE_PLAYER_STRIDE frames apart, so elapsed time is:
+        #   n_samples * ACTIVE_PLAYER_STRIDE / fps
+        # This corrects for the player detection stride so the reported speed is
+        # physically accurate rather than inflated by the subsampling rate.
+        player_velocity_fts = 0.0
         if len(self._energy_player_positions) >= 5:
-            old_p = self._energy_player_positions[0]
-            new_p = self._energy_player_positions[-1]
-            dist    = math.hypot(new_p[0] - old_p[0], new_p[1] - old_p[1])
-            elapsed = len(self._energy_player_positions) / self.fps
-            player_velocity_pps = dist / elapsed if elapsed > 0 else 0.0
+            old_p   = self._energy_player_positions[0]
+            new_p   = self._energy_player_positions[-1]
+            dist_ft = math.hypot(new_p[0] - old_p[0], new_p[1] - old_p[1])
+            elapsed = len(self._energy_player_positions) * self.ACTIVE_PLAYER_STRIDE / self.fps
+            player_velocity_fts = dist_ft / elapsed if elapsed > 0 else 0.0
 
-        if player_velocity_pps > self.PLAYER_SPRINT_VELOCITY_PPS:
-            return (self.ENERGY_BOOST_SPRINT * dt), "SPRINTING"
+        if player_velocity_fts > self.PLAYER_SPRINT_VELOCITY_FTS:
+            return (self.ENERGY_BOOST_SPRINT * dt), f"SPRINTING {player_velocity_fts:.1f}ft/s"
 
-        # Shape change normalised by box height (position-independent)
+        # Shape change normalised by box height (position-independent, pixel space)
         if len(self._energy_player_boxes) >= 5:
             old_b      = self._energy_player_boxes[0]
             new_b      = self._energy_player_boxes[-1]
@@ -510,11 +541,9 @@ class TransitionEngine:
                 if (dw + dh) / box_height > 0.35:
                     return (self.ENERGY_BOOST_SWING * dt), "SWING"
 
-        # Still threshold converted to px/s for consistent comparison
-        still_pps = self.PLAYER_STILL_VELOCITY_THRESHOLD * self.fps
-        if player_velocity_pps < still_pps:
-            return -(self.ENERGY_DECAY_STILL * dt), "STILL"
-        return (0.1 * dt), "MOVING"
+        if player_velocity_fts < self.PLAYER_STILL_VELOCITY_FTS:
+            return -(self.ENERGY_DECAY_STILL * dt), f"STILL {player_velocity_fts:.1f}ft/s"
+        return (0.1 * dt), f"MOVING {player_velocity_fts:.1f}ft/s"
 
     def _detect_walking_gait(self) -> bool:
         """
@@ -692,6 +721,7 @@ class TransitionEngine:
         self._energy_player_boxes.clear()
         self._energy_gait_y_buffer.clear()
         self._ball_trace_pixels.clear()
+        self._smoothed_player_world = None
 
     def _init_active(self, now: float) -> None:
         self._reset_active_state()

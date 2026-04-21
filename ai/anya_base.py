@@ -73,8 +73,9 @@ class AnyaTelemetryProvider:
         try:
             self.static_exclusion_zones = create_auto_exclusion_zones(
                 self.video_path, self.ball_model,
-                num_frames=20,
-                conf=0.05,
+                num_frames=50,
+                conf=0.04,
+                eps=12,
                 padding=5,
                 ball_class_index=Config.DEFAULT_BALL_CLASS_INDEX,
                 analysis_size=(960, 540),
@@ -474,12 +475,17 @@ class AnyaTelemetryProvider:
                     bx1, by1, bx2, by2 = b.xyxy[0].tolist()
                     bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
 
-                    # Filter: must be inside active-zone polygon, outside exclusion zones,
-                    # outside near player box (15px), and outside far player box (10px)
+                    # Filter: must be inside active-zone polygon and outside exclusion zones.
+                    # Player-box filters are opt-in via Config flags (off by default so that
+                    # contact / volley detections inside the player silhouette are kept).
+                    in_near = (Config.FILTER_BALL_IN_NEAR_PLAYER_BOX and
+                               self._is_in_player_box(bcx, bcy, p_box, padding=15))
+                    in_far  = (Config.FILTER_BALL_IN_FAR_PLAYER_BOX and
+                               self._is_in_player_box(bcx, bcy, far_box, padding=10))
                     if (self._is_in_active_zone(bcx, bcy) and
                             not _is_in_exclusion_zone(bcx, bcy, self.exclusion_zones) and
-                            not self._is_in_player_box(bcx, bcy, p_box, padding=15) and
-                            not self._is_in_player_box(bcx, bcy, far_box, padding=10)):
+                            not in_near and
+                            not in_far):
                         world_x, world_y = self.get_world_pos(bcx, bcy)
                         telemetry.active_ball_candidates.append({
                             "box":          (bx1, by1, bx2, by2),

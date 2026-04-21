@@ -261,12 +261,6 @@ def render_active_debug(panel, engine):
                 (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, trace_color, 1)
     y += lh
 
-    # 1b. Net kill indicator
-    in_net = d.get("ball_in_net", False)
-    if in_net:
-        cv2.putText(panel, "BALL IN NET — IMMEDIATE KILL",
-                    (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), 2)
-        y += lh
 
     # 2. Energy bar (shown when active, greyed out when trace is present)
     energy_mode = d.get("energy_bar_mode", False)
