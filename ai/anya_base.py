@@ -63,11 +63,6 @@ class AnyaTelemetryProvider:
         # 3. Compute the active-zone polygon from court vertices (used in ACTIVE state)
         self.active_zone_polygon = self._get_or_define_active_zone()
 
-        # 3b. Precompute baseline y-coordinates (pixel space) for near/far player classification
-        BL, BR, TR, TL = self.court_vertices
-        self._near_baseline_y  = (BL[1] + BR[1]) / 2.0
-        self._far_baseline_y   = (TR[1] + TL[1]) / 2.0
-
         # 4. Compute static exclusion zones from full video scan (one-time at startup)
         print("\n[INFO] Scanning video for static exclusion zones...")
         try:
@@ -293,47 +288,41 @@ class AnyaTelemetryProvider:
 
     def _track_near_player(self, frame):
         """
-        Detect all players and return the near player (closest to near baseline in
-        world space) and the far player (any other detection whose pixel-space feet
-        y2 is closer to the far baseline than to the near baseline).
+        Detect all players and classify using world-space distance from each baseline.
+
+        Near player: detection whose feet (world_y) are closest to the near baseline (y=0).
+        Far player:  detection (excluding near) whose feet are closest to the far baseline (y=78 ft).
 
         Returns (near_box, near_world, far_box).
         """
         results = self.player_model(frame, verbose=False, conf=0.5, imgsz=Config.PLAYER_IMGSZ)
-        near_box, near_world = None, None
-        far_box = None
-        min_near_dist = float('inf')
-        min_far_dist  = float('inf')
 
         if not (results and results[0].boxes):
             return None, None, None
 
-        # First pass — find the near player (smallest world-space distance to near baseline)
+        candidates = []
         for b in results[0].boxes:
             if int(b.cls[0]) != Config.DEFAULT_PLAYER_CLASS_INDEX:
                 continue
             x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
             cx = (x1 + x2) / 2.0
             wx, wy = self.get_world_pos(cx, y2)
-            dist = abs(wy)
-            if dist < min_near_dist:
-                min_near_dist = dist
-                near_box   = (x1, y1, x2, y2)
-                near_world = (wx, wy)
+            candidates.append((x1, y1, x2, y2, wx, wy))
 
-        # Second pass — find the far player: any detection (excluding the near player)
-        # whose feet (y2) are closer to the far baseline than to the near baseline
-        for b in results[0].boxes:
-            if int(b.cls[0]) != Config.DEFAULT_PLAYER_CLASS_INDEX:
-                continue
-            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            if near_box and (x1, y1, x2, y2) == near_box:
-                continue
-            dist_to_near = abs(y2 - self._near_baseline_y)
-            dist_to_far  = abs(y2 - self._far_baseline_y)
-            if dist_to_far < dist_to_near and dist_to_far < min_far_dist:
-                min_far_dist = dist_to_far
-                far_box = (x1, y1, x2, y2)
+        if not candidates:
+            return None, None, None
+
+        # Near player: smallest |world_y| (closest to near baseline at y=0)
+        near = min(candidates, key=lambda c: abs(c[5]))
+        near_box   = near[:4]
+        near_world = (near[4], near[5])
+
+        # Far player: among remaining, smallest distance to far baseline (y=78 ft)
+        rest = [c for c in candidates if c[:4] != near_box]
+        far_box = None
+        if rest:
+            far = min(rest, key=lambda c: abs(c[5] - Config.COURT_LENGTH_FT))
+            far_box = far[:4]
 
         return near_box, near_world, far_box
 
@@ -380,7 +369,7 @@ class AnyaTelemetryProvider:
                         self._armed_frame_buffer,
                         self.ball_model,
                         sample_size=self.ARMED_DYNAMIC_SAMPLE_FRAMES,
-                        conf=0.10,
+                        conf=0.05,
                         eps=5,
                         min_samples=15,
                         padding=5,
@@ -486,14 +475,10 @@ class AnyaTelemetryProvider:
                             not _is_in_exclusion_zone(bcx, bcy, self.exclusion_zones) and
                             not in_near and
                             not in_far):
-                        world_x, world_y = self.get_world_pos(bcx, bcy)
                         telemetry.active_ball_candidates.append({
                             "box":          (bx1, by1, bx2, by2),
                             "conf":         float(b.conf[0]),
-                            "world_x":      world_x,
-                            "world_y":      world_y,
                             "pixel_center": (bcx, bcy),
-                            "track_id":     -1,   # assigned by TransitionEngine
                         })
 
         # Append to buffer

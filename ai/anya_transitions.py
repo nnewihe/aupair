@@ -7,21 +7,22 @@ based on the rolling telemetry buffer from anya_base.py.
 ACTIVE → WAITING uses a two-stage hybrid model:
 
   Stage 1 — Ball Trace Gate (primary):
-    If an active ball trace exists within the BALL_TIMEOUT window (i.e. ball
-    candidates are present AND not identified as a stationary cluster by DBSCAN),
-    the point stays ACTIVE unconditionally.
+    Two rolling 1.5-second pixel-space buffers are maintained:
+      ALL_BALL_HISTORY  — every detection passing zone/exclusion filters.
+      TRACE_BALL_HISTORY — subset where fewer than 5 prior ALL_BALL_HISTORY
+                           entries exist within 40px of the detection centre.
+                           This excludes stationary balls (which accumulate
+                           many hits in the same area) while keeping moving ones.
+    The point stays ACTIVE unconditionally while TRACE_BALL_HISTORY is non-empty.
 
   Stage 2 — Energy Bar Fallback:
-    When no active ball trace has been seen for BALL_TIMEOUT seconds, an energy
-    bar is introduced.  The bar starts at 1.0, anchored to:
-        max(last_active_trace_time, active_start_time + SERVE_TO_ENERGY_DELAY)
+    When TRACE_BALL_HISTORY is empty, an energy bar is introduced.
+    The bar starts at 1.0, anchored to last_active_trace_time.
     It decays or boosts each frame based on near-player telemetry (velocity,
-    shape change, walking gait — same model as near_anya.py).  The point dies
-    when the bar reaches 0.
+    shape change, walking gait).  The point dies when the bar reaches 0.
 
     If a new active ball trace appears while the energy bar is running, the bar
-    is discarded and reset to 1.0 (point stays ACTIVE).  The same two-stage
-    logic applies again if the ball goes quiet a second time.
+    is discarded and reset to 1.0 (point stays ACTIVE).
 
 When a transition fires, `last_transition_time` is set to the anchor time used
 for the energy bar (i.e. when the point effectively died).  The main loop uses
@@ -33,7 +34,6 @@ from typing import List, Optional, Tuple
 import math
 
 import numpy as np
-from sklearn.cluster import DBSCAN
 
 
 class TransitionEngine:
@@ -56,15 +56,11 @@ class TransitionEngine:
         self.EVENT_WINDOW_SECONDS       = 1.2
 
         # ------------------------------------------------------------------
-        # ACTIVE — Ball trace detection
+        # ACTIVE — Ball history buffers (pixel space)
         # ------------------------------------------------------------------
-        self.BALL_TIMEOUT             = 2.5   # seconds — DBSCAN history window
-        self.BALL_DEAD_SPEED_FTS      = 6.0   # ft/s — "stationary" threshold (DBSCAN + trace filter)
-        self.BALL_DEAD_CLUSTER_EPS_FT = 3.0   # ft  — DBSCAN eps
-        self.FAST_BALL_THRESHOLD_FTS  = 15.0  # ft/s — serve/groundstroke speed
-        self.EXTENDED_TIMEOUT_SEC     = 4.0   # extra grace for fast balls
-        self.MAX_BALL_SPEED_FTS       = 176.0 # ft/s — physical upper bound (≈120 mph serve)
-        self.BALL_SPEED_WINDOW_SEC    = 0.15  # seconds — displacement window for speed smoothing
+        self.BALL_HISTORY_SEC       = 1.5   # seconds — rolling window for both ball buffers
+        self.TRACE_NEARBY_PX        = 40.0  # px radius — used to identify stationary detections
+        self.TRACE_NEARBY_MIN_COUNT = 5     # prior detections within radius → exclude from trace
 
         # ------------------------------------------------------------------
         # ACTIVE — Energy bar constants (adapted from near_anya.py Config)
@@ -75,7 +71,7 @@ class TransitionEngine:
         self.ENERGY_DECAY_MISSING         = 0.4  # energy/second drain when player not detected
         self.ENERGY_DECAY_STILL           = 0.25 # energy/second drain while standing still
         self.PLAYER_SPRINT_VELOCITY_FTS   = 7.0  # ft/s (world space) → sprinting
-        self.PLAYER_STILL_VELOCITY_FTS    = 1.5  # ft/s (world space) → standing still
+        self.PLAYER_STILL_VELOCITY_FTS    = 2.0  # ft/s (world space) → standing still
         self.VELOCITY_WINDOW_SIZE         = 20   # number of player position samples to smooth over
         self.ACTIVE_PLAYER_STRIDE         = 4    # must match AnyaTelemetryProvider.ACTIVE_PLAYER_STRIDE
         # Walking gait detection
@@ -110,20 +106,17 @@ class TransitionEngine:
         }
 
         # ------------------------------------------------------------------
-        # Persistent state — ACTIVE (ball tracking)
+        # Persistent state — ACTIVE (ball tracking, pixel space)
         # ------------------------------------------------------------------
-        self.active_start_time:   float = 0.0
-        self.last_ball_seen_time: float = 0.0
+        self.active_start_time:     float = 0.0
 
-        # Rolling world-space ball history over BALL_TIMEOUT window: (t, wx, wy)
-        self._active_ball_world_history: deque = deque()
+        # ALL detections passing zone/exclusion filters: (t, px, py)
+        self._all_ball_history:   deque = deque()
+        # TRACE detections — moving ball only: (t, px, py)
+        self._trace_ball_history: deque = deque()
 
-        # Timestamp of the most recent frame that had an active (non-stationary) trace
+        # Timestamp of the most recent frame that had an active trace
         self.last_active_trace_time: float = 0.0
-
-        # DBSCAN result cache
-        self._stationary_cache_len:    int                    = -1
-        self._stationary_cache_result: List[Tuple[float, float]] = []
 
         # ------------------------------------------------------------------
         # Persistent state — ACTIVE (energy bar)
@@ -155,15 +148,11 @@ class TransitionEngine:
 
         # Debug snapshot for HUD / CSV
         self.last_active_debug = {
-            "time_since_trace":    0.0,
-            "has_active_trace":    False,
-            "energy_bar_mode":     False,
-            "point_energy":        1.0,
-            "player_velocity":     0.0,
-            "shape_change":        0.0,
-            "walking_gait":        False,
-            "ball_count":          0,
-            "window_max_speed_fts": 0.0,
+            "time_since_trace": 0.0,
+            "has_active_trace": False,
+            "energy_bar_mode":  False,
+            "point_energy":     1.0,
+            "ball_count":       0,
         }
 
     # ------------------------------------------------------------------
@@ -344,78 +333,48 @@ class TransitionEngine:
         frame      = history[-1]
         now        = frame.timestamp
         candidates = frame.active_ball_candidates or []
+        cutoff     = now - self.BALL_HISTORY_SEC
 
         # ---- 1. Update player tracking buffers for energy computation ----
         self._update_player_tracking(frame)
 
-        # ---- 2. Update ball history (speed-filtered) ----
-        # For each candidate:
-        #   a) Reject if inter-frame speed exceeds MAX_BALL_SPEED_FTS (physically impossible).
-        #   b) Only add pixel centre to the visual trace if ball is actually moving
-        #      (speed > BALL_DEAD_SPEED_FTS) — stationary detections are excluded from trace.
-        #   c) Track whether any candidate this frame is actually moving (for step 3).
-        any_moving = False
+        # ---- 2. Update ball history buffers (pixel space) ----
+        # For each detection that arrives this frame:
+        #   a) Check how many prior entries in ALL_BALL_HISTORY are within TRACE_NEARBY_PX.
+        #   b) If fewer than TRACE_NEARBY_MIN_COUNT → the ball is moving through this area,
+        #      not sitting still → add to TRACE_BALL_HISTORY and visual trace.
+        #   c) Always add to ALL_BALL_HISTORY afterwards (so current frame doesn't count
+        #      as a prior detection for its own trace test).
         for c in candidates:
-            wx, wy = c.get("world_x", 0.0), c.get("world_y", 0.0)
-            speed_fts = 0.0
+            px, py = c["pixel_center"]
+            nearby = sum(
+                1 for _, hx, hy in self._all_ball_history
+                if math.hypot(px - hx, py - hy) < self.TRACE_NEARBY_PX
+            )
+            if nearby < self.TRACE_NEARBY_MIN_COUNT:
+                self._trace_ball_history.append((now, px, py))
+                self._ball_trace_pixels.append((px, py))
 
-            # Find the reference position from ~BALL_SPEED_WINDOW_SEC ago.
-            # Iterate newest→oldest through history; take the first entry that
-            # is both from a previous frame (t < now) and old enough to cover
-            # the smoothing window.  If history is shorter than the window, use
-            # whatever oldest entry is available — still better than one frame.
-            ref = None
-            for entry in reversed(self._active_ball_world_history):
-                if entry[0] >= now:
-                    continue        # same-frame entry — skip
-                ref = entry         # always keep updating so we have a fallback
-                if now - entry[0] >= self.BALL_SPEED_WINDOW_SEC:
-                    break           # old enough — use this as the reference
+        for c in candidates:
+            px, py = c["pixel_center"]
+            self._all_ball_history.append((now, px, py))
 
-            if ref is not None:
-                ref_t, ref_wx, ref_wy = ref
-                dt_ball = now - ref_t
-                if dt_ball > 0:
-                    speed_fts = math.hypot(wx - ref_wx, wy - ref_wy) / dt_ball
-                    if speed_fts > self.MAX_BALL_SPEED_FTS:
-                        continue    # implausible displacement — discard
+        # Prune expired entries from both buffers
+        while self._all_ball_history   and self._all_ball_history[0][0]   < cutoff:
+            self._all_ball_history.popleft()
+        while self._trace_ball_history and self._trace_ball_history[0][0] < cutoff:
+            self._trace_ball_history.popleft()
 
-            self._active_ball_world_history.append((now, wx, wy))
-
-            if speed_fts > self.BALL_DEAD_SPEED_FTS:
-                any_moving = True
-                pc = c.get("pixel_center")
-                if pc is not None:
-                    self._ball_trace_pixels.append(pc)
-
-        while (self._active_ball_world_history and
-               now - self._active_ball_world_history[0][0] > self.BALL_TIMEOUT):
-            self._active_ball_world_history.popleft()
-
-        if candidates:
-            self.last_ball_seen_time = now
-
-        # ---- 3. Determine whether an active ball trace is present ----
-        # Fast path: no candidates, or all candidates are below BALL_DEAD_SPEED_FTS this
-        # frame → no active trace immediately, without waiting for DBSCAN to converge.
-        # This ensures a ball sitting still (e.g. in the net) is never counted as a live
-        # trace regardless of how long DBSCAN needs to classify the cluster.
-        # Slow path: at least one candidate is moving → fall back to DBSCAN to confirm
-        # it isn't part of a pre-existing stationary cluster.
-        if not candidates or not any_moving:
-            has_active_trace = False
-        else:
-            stationary_clusters = self._get_stationary_clusters()
-            has_active_trace    = not self._is_all_balls_dead(stationary_clusters)
+        # ---- 3. Active trace = any entry in TRACE_BALL_HISTORY ----
+        has_active_trace = bool(self._trace_ball_history)
 
         # ---- 4. Update debug snapshot ----
         self.last_active_debug = {
-            "time_since_trace":     now - self.last_active_trace_time,
-            "has_active_trace":     has_active_trace,
-            "energy_bar_mode":      self.energy_bar_mode,
-            "point_energy":         self.point_energy,
-            "ball_count":           len(candidates),
-            "window_max_speed_fts": self._window_max_speed(),
+            "time_since_trace": now - self.last_active_trace_time,
+            "has_active_trace": has_active_trace,
+            "energy_bar_mode":  self.energy_bar_mode,
+            "point_energy":     self.point_energy,
+            "ball_count":       len(candidates),
         }
 
         # ---- 5a. Active trace present → point is alive ----
@@ -445,9 +404,9 @@ class TransitionEngine:
         self.point_energy = max(0.0, min(1.0, self.point_energy + energy_delta))
 
         self.last_active_debug.update({
-            "energy_bar_mode":  self.energy_bar_mode,
-            "point_energy":     self.point_energy,
-            "energy_status":    status,
+            "energy_bar_mode": self.energy_bar_mode,
+            "point_energy":    self.point_energy,
+            "energy_status":   status,
         })
 
         # ---- 7. Transition when energy reaches zero ----
@@ -578,101 +537,6 @@ class TransitionEngine:
         return self.GAIT_MIN_REVERSALS <= reversals <= self.GAIT_MAX_REVERSALS
 
     # ------------------------------------------------------------------
-    # Stationary-cluster detection (used to define "active trace")
-    # ------------------------------------------------------------------
-
-    def _get_stationary_clusters(self) -> List[Tuple[float, float]]:
-        """Identify clusters that have stayed stationary for the timeout duration."""
-        buf = self._active_ball_world_history
-        if len(buf) < 5:
-            return []
-
-        if len(buf) == self._stationary_cache_len:
-            return self._stationary_cache_result
-
-        times = np.array([t for t, _, _ in buf])
-        pts   = np.array([[wx, wy] for _, wx, wy in buf])
-
-        if (times[-1] - times[0]) < (self.BALL_TIMEOUT - 0.1):
-            self._stationary_cache_len    = len(buf)
-            self._stationary_cache_result = []
-            return []
-
-        labels = DBSCAN(eps=self.BALL_DEAD_CLUSTER_EPS_FT, min_samples=3).fit_predict(pts)
-        stationary = []
-        for lbl in set(labels):
-            if lbl == -1:
-                continue
-            mask    = labels == lbl
-            c_pts   = pts[mask]
-            c_times = times[mask]
-            t_span  = c_times.max() - c_times.min()
-            if t_span < (self.BALL_TIMEOUT - 0.5):
-                continue
-            diffs = c_pts[:, None, :] - c_pts[None, :, :]
-            max_d = np.sqrt((diffs ** 2).sum(axis=2)).max()
-            if (max_d / t_span) < self.BALL_DEAD_SPEED_FTS:
-                stationary.append(tuple(np.mean(c_pts, axis=0)))
-
-        self._stationary_cache_len    = len(buf)
-        self._stationary_cache_result = stationary
-        return stationary
-
-    def _is_all_balls_dead(self, stationary_clusters) -> bool:
-        """
-        True if all detected ball positions belong to stationary clusters
-        (i.e. no kinetic "trace" of a moving ball).
-        """
-        if not stationary_clusters:
-            return False
-
-        buf = self._active_ball_world_history
-        pts = np.array([[wx, wy] for _, wx, wy in buf])
-
-        kinetic_points = [
-            p for p in pts
-            if not any(
-                math.hypot(p[0] - c[0], p[1] - c[1]) < self.BALL_DEAD_CLUSTER_EPS_FT
-                for c in stationary_clusters
-            )
-        ]
-        if len(kinetic_points) < 3:
-            return True
-
-        kp         = np.array(kinetic_points)
-        trace_span = math.hypot(kp[:, 0].max() - kp[:, 0].min(),
-                                kp[:, 1].max() - kp[:, 1].min())
-        TRACE_THRESHOLD_FT = 8.0
-        return trace_span <= TRACE_THRESHOLD_FT
-
-    # ------------------------------------------------------------------
-    # Speed helpers (used for debug snapshot)
-    # ------------------------------------------------------------------
-
-    def _last_ball_speed_fts(self) -> float:
-        buf = self._active_ball_world_history
-        if len(buf) < 2:
-            return 0.0
-        t1, x1, y1 = buf[-2]
-        t2, x2, y2 = buf[-1]
-        dt = t2 - t1
-        if dt <= 0:
-            return 0.0
-        return math.hypot(x2 - x1, y2 - y1) / dt
-
-    def _window_max_speed(self) -> float:
-        buf = self._active_ball_world_history
-        if len(buf) < 2:
-            return 0.0
-        t_span = buf[-1][0] - buf[0][0]
-        if t_span <= 0:
-            return 0.0
-        pts   = np.array([[wx, wy] for _, wx, wy in buf])
-        diffs = pts[:, None, :] - pts[None, :, :]
-        max_d = np.sqrt((diffs ** 2).sum(axis=2)).max()
-        return max_d / t_span
-
-    # ------------------------------------------------------------------
     # Helpers — reset / init
     # ------------------------------------------------------------------
 
@@ -706,17 +570,15 @@ class TransitionEngine:
         }
 
     def _reset_active_state(self) -> None:
-        self._active_ball_world_history.clear()
-        self.last_ball_seen_time      = 0.0
-        self.active_start_time        = 0.0
-        self.last_active_trace_time   = 0.0
-        self._stationary_cache_len    = -1
-        self._stationary_cache_result = []
+        self._all_ball_history.clear()
+        self._trace_ball_history.clear()
+        self.active_start_time      = 0.0
+        self.last_active_trace_time = 0.0
         self._player_missing_frames = 0
         # Energy bar
-        self.energy_bar_mode          = False
-        self.energy_bar_start_time    = 0.0
-        self.point_energy             = 1.0
+        self.energy_bar_mode        = False
+        self.energy_bar_start_time  = 0.0
+        self.point_energy           = 1.0
         self._energy_player_positions.clear()
         self._energy_player_boxes.clear()
         self._energy_gait_y_buffer.clear()
@@ -726,6 +588,5 @@ class TransitionEngine:
     def _init_active(self, now: float) -> None:
         self._reset_active_state()
         self.active_start_time      = now
-        self.last_ball_seen_time    = now
         self.last_active_trace_time = now
         self.last_transition_time   = None

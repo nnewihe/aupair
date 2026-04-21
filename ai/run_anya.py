@@ -34,7 +34,7 @@ def run_anya_pipeline(video_path, output_path="output.mp4", headless=False, star
         "point", "frame", "timestamp", "state",
         "time_since_trace", "has_active_trace",
         "energy_bar_mode", "point_energy", "energy_status",
-        "ball_count", "window_max_speed",
+        "ball_count",
     ]
     csv_file   = open(csv_path, "w", newline="")
     csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_COLS)
@@ -148,7 +148,6 @@ def _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point):
         "point_energy":     round(debug.get("point_energy", 1.0), 3),
         "energy_status":    debug.get("energy_status", ""),
         "ball_count":       debug.get("ball_count", 0),
-        "window_max_speed": round(debug.get("window_max_speed_fts", 0.0), 3),
     })
 
 
@@ -286,10 +285,9 @@ def render_active_debug(panel, engine):
         cv2.rectangle(panel, (bar_x, bar_y), (bar_x + int(energy * bar_w), bar_y + 14), fill_col, -1)
     y += 24
 
-    # 3. Ball count / speed
+    # 3. Ball count
     ball_count = d.get("ball_count", 0)
-    speed      = d.get("window_max_speed_fts", 0.0)
-    cv2.putText(panel, f"Balls: {ball_count}   Max speed: {speed:.1f} ft/s",
+    cv2.putText(panel, f"Balls detected: {ball_count}",
                 (x0, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (80, 80, 80), 1)
 
 
