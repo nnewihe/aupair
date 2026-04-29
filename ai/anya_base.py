@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Any
 from sklearn.cluster import DBSCAN
 from src.ai.utilities import (BoxSmoother, Config, _is_in_exclusion_zone, init_court,
-                               create_auto_exclusion_zones, get_exclusion_zones_from_frames, Point3D, Box)
+                               init_far_player_roi, create_auto_exclusion_zones,
+                               get_exclusion_zones_from_frames, Point3D, Box)
 from collections import deque
 
 @dataclass
@@ -56,7 +57,13 @@ class AnyaTelemetryProvider:
             self.video_path,
             analysis_size=(960, 540)
         )
-        
+
+        # 1b. Far-player ROI — user clicks two diagonal corners once; cached per video.
+        self.far_player_roi = init_far_player_roi(
+            self.video_path,
+            analysis_size=(960, 540),
+        )
+
         # 2. Compute Homography
         self.H = self._compute_homography()
 
@@ -102,6 +109,9 @@ class AnyaTelemetryProvider:
         # Cached player boxes for ACTIVE-state striding (player tracked every N frames)
         self.ACTIVE_PLAYER_STRIDE = 4
         self._cached_player_boxes: Tuple = (None, None, None)  # (near_box, near_world, far_box)
+
+        # Last known far player box — persists across frames where ROI detection returns None
+        self._last_known_far_box: Optional[Tuple[int, int, int, int]] = None
 
         # Trophy model stride (run every N frames in ARMED state)
         self.ARMED_TROPHY_STRIDE = 2
@@ -293,6 +303,11 @@ class AnyaTelemetryProvider:
         Near player: detection whose feet (world_y) are closest to the near baseline (y=0).
         Far player:  detection (excluding near) whose feet are closest to the far baseline (y=78 ft).
 
+        Near-player candidates are pre-filtered to:
+          1. Feet closer to the near baseline than the far baseline (world_y < COURT_LENGTH/2).
+          2. Feet x within the lateral span of the near baseline (0..COURT_WIDTH_FT) plus a
+             small homography-tolerance padding (NEAR_PLAYER_X_PAD_FT).
+
         Returns (near_box, near_world, far_box).
         """
         results = self.player_model(frame, verbose=False, conf=0.5, imgsz=Config.PLAYER_IMGSZ)
@@ -312,8 +327,21 @@ class AnyaTelemetryProvider:
         if not candidates:
             return None, None, None
 
+        # ── Near-player candidate filter ──────────────────────────────────
+        # Criterion 1: feet closer to near baseline (y=0) than far baseline (y=78 ft)
+        # Criterion 2: feet x within the near-baseline width (+/- padding)
+        pad = Config.NEAR_PLAYER_X_PAD_FT
+        near_candidates = [
+            c for c in candidates
+            if (abs(c[5]) < abs(c[5] - Config.COURT_LENGTH_FT) and          # criterion 1
+                -pad <= c[4] <= Config.COURT_WIDTH_FT + pad)                 # criterion 2
+        ]
+
+        if not near_candidates:
+            return None, None, None
+
         # Near player: smallest |world_y| (closest to near baseline at y=0)
-        near = min(candidates, key=lambda c: abs(c[5]))
+        near = min(near_candidates, key=lambda c: abs(c[5]))
         near_box   = near[:4]
         near_world = (near[4], near[5])
 
@@ -325,6 +353,52 @@ class AnyaTelemetryProvider:
             far_box = far[:4]
 
         return near_box, near_world, far_box
+
+    def _track_far_player_roi(self, frame) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Detect the far player within the user-defined ROI.
+
+        Crops the frame to the ROI rectangle, runs the player model at
+        Config.FAR_PLAYER_IMGSZ, and returns the highest-confidence detection
+        translated back to full-frame pixel coordinates.
+
+        Detections whose bottom edge falls within Config.FAR_ROI_BOTTOM_TOLERANCE
+        pixels of the ROI bottom are rejected — these represent the near player's
+        body intruding into the bottom of the search area.
+
+        Returns None if the ROI is not configured, produces no detections, or all
+        detections are filtered out.
+        """
+        if self.far_player_roi is None:
+            return None
+        (rx1, ry1), (rx2, ry2) = self.far_player_roi
+        roi = frame[ry1:ry2, rx1:rx2]
+        if roi.size == 0:
+            return None
+
+        results = self.player_model(
+            roi, verbose=False, conf=0.5, imgsz=Config.FAR_PLAYER_IMGSZ
+        )
+        if not (results and results[0].boxes):
+            return None
+
+        roi_h     = ry2 - ry1
+        best_conf = -1.0
+        best_box  = None
+
+        for b in results[0].boxes:
+            if int(b.cls[0]) != Config.DEFAULT_PLAYER_CLASS_INDEX:
+                continue
+            lx1, ly1, lx2, ly2 = map(int, b.xyxy[0].tolist())
+            conf = float(b.conf[0])
+            # Reject if bottom of box is flush with ROI bottom — near-player interference
+            if (roi_h - ly2) <= Config.FAR_ROI_BOTTOM_TOLERANCE:
+                continue
+            if conf > best_conf:
+                best_conf = conf
+                best_box  = (rx1 + lx1, ry1 + ly1, rx1 + lx2, ry1 + ly2)
+
+        return best_box
 
     def process_frame(self, frame) -> TelemetryFrame:
         self.frame_counter += 1
@@ -339,15 +413,28 @@ class AnyaTelemetryProvider:
         )
 
         # 1. Track near/far player.
-        # In ACTIVE state, run the player model every ACTIVE_PLAYER_STRIDE frames and
-        # hold the cached result in between — the player position changes slowly and
-        # the box is only used for ball-detection filtering and the near-player timer.
+        # In ACTIVE state, run the player models every ACTIVE_PLAYER_STRIDE frames and
+        # hold the cached results in between — the player position changes slowly and
+        # the boxes are only used for ball-detection filtering and the near-player timer.
+        # Far player is detected via the user-defined ROI (Config.FAR_PLAYER_IMGSZ) in
+        # ACTIVE state; full-frame detection is used in WAITING/ARMED states.
         if (self.current_state == "ACTIVE"
                 and self.frame_counter % self.ACTIVE_PLAYER_STRIDE != 0
                 and self._cached_player_boxes[0] is not None):
             p_box, p_world, far_box = self._cached_player_boxes
         else:
-            p_box, p_world, far_box = self._track_near_player(frame)
+            p_box, p_world, full_frame_far = self._track_near_player(frame)
+            if self.current_state == "ACTIVE":
+                detected_far = self._track_far_player_roi(frame)
+                if detected_far is not None:
+                    far_box = detected_far
+                    self._last_known_far_box = detected_far
+                else:
+                    # Persist last known far box when current detection is missed
+                    far_box = self._last_known_far_box
+            else:
+                far_box = full_frame_far
+                self._last_known_far_box = None  # reset persistence outside ACTIVE
             self._cached_player_boxes = (p_box, p_world, far_box)
         telemetry.near_player_box   = p_box
         telemetry.near_player_world = p_world
@@ -483,6 +570,9 @@ class AnyaTelemetryProvider:
     def update_state(self, new_state: str):
         old_state = self.current_state
         self.current_state = new_state
+
+        if old_state == "ACTIVE" and new_state != "ACTIVE":
+            self._last_known_far_box = None
 
         if new_state == "ARMED" and old_state != "ARMED":
             now = self.frame_counter / self.fps

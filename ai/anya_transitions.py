@@ -67,9 +67,9 @@ class TransitionEngine:
         # ------------------------------------------------------------------
         self.ENERGY_BOOST_SPRINT          = 4.0  # energy/second while sprinting
         self.ENERGY_BOOST_SWING           = 4.0  # energy/second during swing/split-step
-        self.ENERGY_DECAY_WALKING         = 0.35 # energy/second drain while walking
-        self.ENERGY_DECAY_MISSING         = 0.5  # energy/second drain when player not detected
-        self.ENERGY_DECAY_STILL           = 0.25 # energy/second drain while standing still
+        self.ENERGY_DECAY_WALKING         = 0.3 # energy/second drain while walking
+        self.ENERGY_DECAY_MISSING         = 0.4  # energy/second drain when player not detected
+        self.ENERGY_DECAY_STILL           = 0.2 # energy/second drain while standing still
         self.PLAYER_SPRINT_VELOCITY_FTS   = 7.0  # ft/s (world space) → sprinting
         self.PLAYER_STILL_VELOCITY_FTS    = 2.0  # ft/s (world space) → standing still
         self.VELOCITY_WINDOW_SIZE         = 20   # number of player position samples to smooth over
@@ -79,6 +79,11 @@ class TransitionEngine:
         self.GAIT_MIN_REVERSALS  = 2
         self.GAIT_MAX_REVERSALS  = 8
         self.GAIT_MIN_DRIFT_PX   = 10.0
+
+        # Bottom-of-screen gait override: if near player box bottom is within
+        # this many pixels of the analysis frame bottom, treat as walking.
+        self.SCREEN_HEIGHT_PX             = 540
+        self.BOTTOM_SCREEN_TOLERANCE_PX   = 8
 
         # ------------------------------------------------------------------
         # Persistent state — WAITING
@@ -465,6 +470,12 @@ class TransitionEngine:
         if self._player_missing_frames > self.PLAYER_MISSING_GRACE_FRAMES:
             return -(self.ENERGY_DECAY_MISSING * dt), "MISSING"
 
+        # Near player clipped at bottom of frame → treat as walking, speed unknown
+        near_box = frame.near_player_box
+        if (near_box is not None and
+                near_box[3] >= self.SCREEN_HEIGHT_PX - self.BOTTOM_SCREEN_TOLERANCE_PX):
+            return -(self.ENERGY_DECAY_WALKING * dt), "WALKING_OFFSCREEN"
+
         if self._detect_walking_gait():
             return -(self.ENERGY_DECAY_WALKING * dt), "WALKING"
 
@@ -492,7 +503,7 @@ class TransitionEngine:
             if box_height > 0:
                 dw = abs((new_b[2] - new_b[0]) - (old_b[2] - old_b[0]))
                 dh = abs((new_b[3] - new_b[1]) - (old_b[3] - old_b[1]))
-                if (dw + dh) / box_height > 0.35:
+                if (dw + dh) / box_height > 0.25:
                     return (self.ENERGY_BOOST_SWING * dt), "SWING"
 
         if player_velocity_fts < self.PLAYER_STILL_VELOCITY_FTS:

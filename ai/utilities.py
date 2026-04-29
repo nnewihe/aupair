@@ -9,7 +9,6 @@ import numpy as np
 from typing import List, Optional, Tuple
 import math
 from sklearn.cluster import DBSCAN
-from moviepy import VideoFileClip, concatenate_videoclips
 import os
 import json
 import csv
@@ -27,15 +26,19 @@ import shutil
 class Config:
     ANALYSIS_WIDTH = 960
     ANALYSIS_HEIGHT = 540
-    PLAYER_IMGSZ = 480
+    PLAYER_IMGSZ = 960
     BALL_IMGSZ = 960
     TOSS_BALL_IMGSZ = 320
+    FAR_PLAYER_IMGSZ = 640          # YOLO inference size for far-player ROI detection
+    FAR_ROI_BOTTOM_TOLERANCE = 5    # px — reject far-player detections whose bottom is within
+                                    # this many pixels of the ROI bottom (near-player intrusion)
     ACTIVE_BALL_CONF = 0.15   # confidence threshold for whole-court ball detection (ACTIVE)
     TOSS_BALL_CONF   = 0.10   # confidence threshold for toss ROI ball detection (ARMED)
     TROPHY_IMGSZ = 320
     COURT_WIDTH_FT = 27.0
     COURT_LENGTH_FT = 78.0
     COURT_X_PADDING_FT = 15.0
+    NEAR_PLAYER_X_PAD_FT = 3.0   # homography-tolerance padding beyond near-baseline width
     DEFAULT_BALL_CLASS_INDEX = 0
     DEFAULT_PLAYER_CLASS_INDEX = 0
     DEFAULT_NEAR_TROPHY_MODEL_PATH  = "weights/trophy_pose_cls2/weights/best.pt"
@@ -282,6 +285,12 @@ def _court_cache_path(video_path: str) -> str:
     return os.path.join(video_dir, f"{video_name}_court_cache.json")
 
 
+def _far_player_roi_cache_path(video_path: str) -> str:
+    video_dir  = os.path.dirname(os.path.abspath(video_path))
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(video_dir, f"{video_name}_far_player_roi.json")
+
+
 def init_court(video_path: str, target_idx: int = 300, analysis_size: tuple = None):
     """Interactive court corner selection with JSON caching."""
     cache_path = _court_cache_path(video_path)
@@ -346,6 +355,109 @@ def init_court(video_path: str, target_idx: int = 300, analysis_size: tuple = No
             cv2.destroyWindow(win)
             cv2.waitKey(1)
             raise RuntimeError("Court polygon selection aborted by user.")
+
+
+def init_far_player_roi(
+    video_path: str,
+    target_idx: int = 300,
+    analysis_size: tuple = None,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Interactive ROI selection for the far-player YOLO search area.
+
+    The user clicks two diagonal corners of the desired rectangle.  The result
+    is normalised to (top-left, bottom-right) and cached next to the video as
+    ``{name}_far_player_roi.json``.
+
+    Returns
+    -------
+    ((x1, y1), (x2, y2))  — axis-aligned ROI in analysis-frame pixel coordinates.
+
+    Keys
+    ----
+    Left-click : place a corner (auto-confirms after second click)
+    r          : reset and re-click
+    q / Esc    : abort (raises RuntimeError)
+    """
+    cache_path = _far_player_roi_cache_path(video_path)
+    target_size = tuple(list(analysis_size) if analysis_size else [None, None])
+
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            if tuple(cached.get("analysis_size", [None, None])) == target_size:
+                pt1 = tuple(cached["pt1"])
+                pt2 = tuple(cached["pt2"])
+                print(f"[FAR ROI] Loaded cached ROI from: {os.path.basename(cache_path)}")
+                return pt1, pt2
+            else:
+                print("[FAR ROI] Analysis size changed — re-selecting ROI.")
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            print(f"[FAR ROI] Cache corrupt ({e}), re-selecting.")
+
+    base = get_reference_frame(video_path, target_idx=target_idx)
+    if analysis_size is not None:
+        base = cv2.resize(base, analysis_size, interpolation=cv2.INTER_AREA)
+
+    win   = "Click 2 diagonal corners of far-player search area  [r=reset  q=quit]"
+    state = {"base": base.copy(), "img": base.copy(), "pts": [], "done": False, "win": win}
+
+    def _cb(event, x, y, flags, param):
+        s = param
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        s["pts"].append((x, y))
+        if len(s["pts"]) == 1:
+            cv2.circle(s["img"], (x, y), 6, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+        elif len(s["pts"]) == 2:
+            s["img"] = s["base"].copy()
+            p1 = (min(s["pts"][0][0], x), min(s["pts"][0][1], y))
+            p2 = (max(s["pts"][0][0], x), max(s["pts"][0][1], y))
+            cv2.rectangle(s["img"], p1, p2, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+            cv2.circle(s["img"], s["pts"][0], 6, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+            cv2.circle(s["img"], (x, y),       6, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+            s["done"] = True
+        cv2.imshow(s["win"], s["img"])
+
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.imshow(win, state["img"])
+    cv2.setMouseCallback(win, _cb, state)
+
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if state["done"]:
+            cv2.destroyWindow(win)
+            cv2.waitKey(1)
+            pts = state["pts"]
+            x1  = min(pts[0][0], pts[1][0])
+            y1  = min(pts[0][1], pts[1][1])
+            x2  = max(pts[0][0], pts[1][0])
+            y2  = max(pts[0][1], pts[1][1])
+            pt1, pt2 = (x1, y1), (x2, y2)
+            try:
+                cache_data = {
+                    "pt1":           list(pt1),
+                    "pt2":           list(pt2),
+                    "analysis_size": list(analysis_size) if analysis_size else [None, None],
+                    "video":         os.path.basename(video_path),
+                }
+                with open(cache_path, "w") as f:
+                    json.dump(cache_data, f, indent=2)
+                print(f"[FAR ROI] Saved ROI to: {os.path.basename(cache_path)}")
+            except Exception as e:
+                print(f"[FAR ROI] WARN: Could not save cache: {e}")
+            return pt1, pt2
+
+        if key == ord("r"):
+            state["pts"].clear()
+            state["done"] = False
+            state["img"] = state["base"].copy()
+            cv2.imshow(win, state["img"])
+
+        if key in (ord("q"), 27):
+            cv2.destroyWindow(win)
+            cv2.waitKey(1)
+            raise RuntimeError("Far-player ROI selection aborted by user.")
 
 
 def point_line_distance_px(P, A, B):
@@ -440,3 +552,150 @@ def probe_video(video_path: str) -> dict:
 def resize_for_analysis(frame):
     return cv2.resize(frame, (Config.ANALYSIS_WIDTH, Config.ANALYSIS_HEIGHT),
                       interpolation=cv2.INTER_AREA)
+
+
+def create_highlights_ffmpeg_multisource(
+    segments: List[Tuple[str, float, float]],
+    output_path: str,
+) -> None:
+    """
+    Cut segments from multiple source videos and concatenate into output_path.
+
+    Parameters
+    ----------
+    segments    : list of (source_video_path, start_sec, end_sec)
+    output_path : destination path for the highlight reel
+    """
+    if not segments:
+        print("[HIGHLIGHT] No segments to export.")
+        return
+
+    valid = [(src, s, e) for src, s, e in segments if e > s]
+    if not valid:
+        print("[HIGHLIGHT] All segments are zero-length — nothing to export.")
+        return
+
+    print(f"\n[HIGHLIGHT] Creating multi-source highlight reel: {len(valid)} segment(s) → {output_path}")
+
+    tmpdir = tempfile.mkdtemp(prefix="anya_highlights_")
+    try:
+        seg_files = []
+        for i, (src, start, end) in enumerate(valid):
+            seg_path = os.path.join(tmpdir, f"seg_{i:04d}.mp4")
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{start:.3f}",
+                "-to", f"{end:.3f}",
+                "-i", src,
+                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k",
+                "-vsync", "cfr",
+                seg_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0:
+                print(f"[HIGHLIGHT] Warning: segment {i} ({start:.2f}s–{end:.2f}s) from "
+                      f"{os.path.basename(src)} failed.")
+                print(result.stderr.decode(errors="replace"))
+                continue
+            seg_files.append(seg_path)
+            print(f"[HIGHLIGHT]   Segment {i+1}/{len(valid)}: {os.path.basename(src)} "
+                  f"{start:.2f}s – {end:.2f}s")
+
+        if not seg_files:
+            print("[HIGHLIGHT] No segments were successfully extracted.")
+            return
+
+        concat_list = os.path.join(tmpdir, "concat.txt")
+        with open(concat_list, "w") as f:
+            for sf in seg_files:
+                f.write(f"file '{sf}'\n")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c", "copy",
+            output_path,
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            print(f"[HIGHLIGHT] Saved: {output_path}")
+        else:
+            print("[HIGHLIGHT] Concatenation step failed — check FFMPEG output above.")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def create_highlights_ffmpeg(
+    video_path: str,
+    segments: List[Tuple[float, float]],
+    output_path: str,
+) -> None:
+    """
+    Cut active segments from video_path using FFMPEG (preserves audio) and
+    concatenate into output_path.
+
+    Parameters
+    ----------
+    video_path  : path to the original source video
+    segments    : list of (start_sec, end_sec) in source video time
+    output_path : destination path for the highlight reel
+    """
+    if not segments:
+        print("[HIGHLIGHT] No active segments to export.")
+        return
+
+    valid = [(s, e) for s, e in segments if e > s]
+    if not valid:
+        print("[HIGHLIGHT] All segments are zero-length — nothing to export.")
+        return
+
+    print(f"\n[HIGHLIGHT] Creating highlight reel: {len(valid)} segment(s) → {output_path}")
+
+    tmpdir = tempfile.mkdtemp(prefix="anya_highlights_")
+    try:
+        seg_files = []
+        for i, (start, end) in enumerate(valid):
+            seg_path = os.path.join(tmpdir, f"seg_{i:04d}.mp4")
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{start:.3f}",
+                "-to", f"{end:.3f}",
+                "-i", video_path,
+                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k",
+                "-vsync", "cfr",
+                seg_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0:
+                print(f"[HIGHLIGHT] Warning: segment {i} ({start:.2f}s–{end:.2f}s) failed.")
+                print(result.stderr.decode(errors="replace"))
+                continue
+            seg_files.append(seg_path)
+            print(f"[HIGHLIGHT]   Segment {i+1}/{len(valid)}: {start:.2f}s – {end:.2f}s")
+
+        if not seg_files:
+            print("[HIGHLIGHT] No segments were successfully extracted.")
+            return
+
+        concat_list = os.path.join(tmpdir, "concat.txt")
+        with open(concat_list, "w") as f:
+            for sf in seg_files:
+                f.write(f"file '{sf}'\n")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c", "copy",
+            output_path,
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            print(f"[HIGHLIGHT] Saved: {output_path}")
+        else:
+            print("[HIGHLIGHT] Concatenation step failed — check FFMPEG output above.")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

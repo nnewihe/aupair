@@ -7,29 +7,56 @@ import numpy as np
 
 from src.ai.anya_base import AnyaTelemetryProvider, TelemetryFrame
 from src.ai.anya_transitions import TransitionEngine
+from src.ai.utilities import create_highlights_ffmpeg, create_highlights_ffmpeg_multisource
 
 
-def run_anya_pipeline(video_path, output_path="output.mp4", headless=False, start_frame=0):
-    # ── Probe original video properties ───────────────────────────────────
-    _probe = cv2.VideoCapture(video_path)
-    orig_w   = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h   = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# ── Serve-run filtering constants ─────────────────────────────────────────────
+# Serves from the same camera side cluster into "runs".  A run is a group of
+# consecutive active segments whose inter-segment gap is ≤ GAP_THRESHOLD_SEC.
+# Runs shorter than MIN_SERVES_PER_RUN are discarded as spurious detections.
+MIN_SERVES_PER_RUN  = 8
+GAP_THRESHOLD_SEC   = 240.0   # 4 minutes — spans short changeovers within a run
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core segment-collection loop (shared by single and dual pipeline modes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _collect_segments(video_path, headless=False, start_frame=0, csv_path=None):
+    """
+    Run the Anya pipeline on a single video and return the detected active segments.
+
+    Parameters
+    ----------
+    video_path  : source video file
+    headless    : suppress all OpenCV windows
+    start_frame : seek to this frame before starting (default 0)
+    csv_path    : explicit CSV output path; defaults to <video_dir>/<stem>_telemetry.csv
+
+    Returns
+    -------
+    active_segments : list of (start_sec, end_sec) in source-video time
+    point_number    : total points detected
+    csv_path        : path to the written telemetry CSV
+    """
+    # ── Default CSV path ──────────────────────────────────────────────────
+    if csv_path is None:
+        video_dir  = os.path.dirname(os.path.abspath(video_path))
+        video_stem = os.path.splitext(os.path.basename(video_path))[0]
+        csv_path   = os.path.join(video_dir, f"{video_stem}_telemetry.csv")
+
+    # ── Probe original video properties ──────────────────────────────────
+    _probe   = cv2.VideoCapture(video_path)
     orig_fps = _probe.get(cv2.CAP_PROP_FPS)
     _probe.release()
     if orig_fps <= 0 or orig_fps > 300:
         orig_fps = 30.0
 
-    # ── Initialize pipeline components ────────────────────────────────────
-    # AnyaTelemetryProvider triggers interactive court selection on init.
+    # ── Initialize pipeline components ───────────────────────────────────
     telemetry_provider = AnyaTelemetryProvider(video_path)
-    engine = TransitionEngine(fps=telemetry_provider.fps)
+    engine             = TransitionEngine(fps=telemetry_provider.fps)
 
-    # ── Output video writer (clean original footage, ACTIVE frames only) ──
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, orig_fps, (orig_w, orig_h))
-
-    # ── CSV telemetry writer ───────────────────────────────────────────────
-    csv_path = os.path.splitext(output_path)[0] + "_telemetry.csv"
+    # ── CSV telemetry writer ──────────────────────────────────────────────
     _CSV_COLS = [
         "point", "frame", "timestamp", "state",
         "time_since_trace", "has_active_trace",
@@ -40,103 +67,301 @@ def run_anya_pipeline(video_path, output_path="output.mp4", headless=False, star
     csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_COLS)
     csv_writer.writeheader()
 
-    # ── Main loop ──────────────────────────────────────────────────────────
-    cap           = cv2.VideoCapture(video_path)
-    point_number  = 0
+    # ── Segment tracking ──────────────────────────────────────────────────
+    _probe2 = cv2.VideoCapture(video_path)
+    _total_frames      = int(_probe2.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration_sec = _total_frames / orig_fps if _total_frames > 0 else float("inf")
+    _probe2.release()
+
+    video_time_offset     = start_frame / orig_fps
+    active_segments       = []
+    current_segment_start: float = 0.0
+    last_telemetry_ts:     float = 0.0
+    HIGHLIGHT_END_PAD_SEC = 1.0
+
+    # ── Main loop ─────────────────────────────────────────────────────────
+    cap            = cv2.VideoCapture(video_path)
+    point_number   = 0
     frame_in_point = 0
 
-    # Seek to start frame if specified
     if start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         print(f"[DEBUG] Seeking to frame {start_frame}")
 
-    # --- Updated section within run_anya_pipeline (run_anya.py) ---
-
     WAITING_STRIDE = 3
+    interrupted    = False
 
-    while cap.isOpened():
-        success, orig_frame = cap.read()
-        if not success:
-            break
-
-        # Resize here so `frame` is always defined for the debug display below
-        frame = cv2.resize(orig_frame, (960, 540), interpolation=cv2.INTER_LINEAR)
-
-        skip_inference = (
-            telemetry_provider.current_state == "WAITING"
-            and telemetry_provider.frame_counter % WAITING_STRIDE != 0
-            and bool(telemetry_provider.telemetry_history)
-        )
-
-        if skip_inference:
-            # Advance the counter so timestamps stay continuous
-            telemetry_provider.frame_counter += 1
-            last = telemetry_provider.telemetry_history[-1]
-            telemetry = TelemetryFrame(
-                frame_id=telemetry_provider.frame_counter,
-                timestamp=telemetry_provider.frame_counter / telemetry_provider.fps,
-                state="WAITING",
-                near_player_box=last.near_player_box,
-                near_player_world=last.near_player_world,
-                toss_ball_candidates=[],
-                active_ball_candidates=[],
-            )
-            telemetry_provider.telemetry_history.append(telemetry)
-        else:
-            telemetry = telemetry_provider.process_frame(frame)
-
-        new_state = engine.evaluate_transitions(
-            telemetry_provider.telemetry_history,
-            telemetry_provider.current_state,
-        )
-
-        if new_state != telemetry_provider.current_state:
-            if new_state == "ACTIVE":
-                point_number += 1
-                frame_in_point = 0
-            telemetry_provider.update_state(new_state)
-
-        current_state = telemetry_provider.current_state
-
-        # -- Write output video & CSV during ACTIVE --
-        if current_state == "ACTIVE":
-            # LABEL THE POINT NUMBER ON THE ORIGINAL FRAME
-            cv2.putText(orig_frame, f"Point {point_number}", (50, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 0), 4, cv2.LINE_AA)
-            
-            writer.write(orig_frame)
-            frame_in_point += 1
-            _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point)
-
-        # ── Debug visualisation (skipped when headless) ────────────────────
-        if not headless:
-            render_frame(frame, telemetry, current_state, engine,
-                         telemetry_provider.exclusion_zones,
-                         telemetry_provider.active_zone_polygon)
-            debug_panel = render_debug_panel(current_state, engine, telemetry_provider)
-            cv2.imshow("Anya Pipeline", frame)
-            cv2.imshow("Debug Panel", debug_panel)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+    try:
+        while cap.isOpened():
+            success, orig_frame = cap.read()
+            if not success:
                 break
 
-    # ── Cleanup ────────────────────────────────────────────────────────────
-    cap.release()
-    writer.release()
-    csv_file.close()
-    if not headless:
-        cv2.destroyAllWindows()
+            frame = cv2.resize(orig_frame, (960, 540), interpolation=cv2.INTER_LINEAR)
+
+            skip_inference = (
+                telemetry_provider.current_state == "WAITING"
+                and telemetry_provider.frame_counter % WAITING_STRIDE != 0
+                and bool(telemetry_provider.telemetry_history)
+            )
+
+            if skip_inference:
+                telemetry_provider.frame_counter += 1
+                last = telemetry_provider.telemetry_history[-1]
+                telemetry = TelemetryFrame(
+                    frame_id=telemetry_provider.frame_counter,
+                    timestamp=telemetry_provider.frame_counter / telemetry_provider.fps,
+                    state="WAITING",
+                    near_player_box=last.near_player_box,
+                    near_player_world=last.near_player_world,
+                    toss_ball_candidates=[],
+                    active_ball_candidates=[],
+                )
+                telemetry_provider.telemetry_history.append(telemetry)
+            else:
+                telemetry = telemetry_provider.process_frame(frame)
+
+            last_telemetry_ts = telemetry.timestamp
+
+            new_state = engine.evaluate_transitions(
+                telemetry_provider.telemetry_history,
+                telemetry_provider.current_state,
+            )
+
+            old_state = telemetry_provider.current_state
+            if new_state != old_state:
+                if new_state == "ACTIVE":
+                    point_number   += 1
+                    frame_in_point  = 0
+                    current_segment_start = video_time_offset + telemetry.timestamp
+                elif old_state == "ACTIVE":
+                    end_t = (engine.last_transition_time
+                             if engine.last_transition_time is not None
+                             else telemetry.timestamp)
+                    padded_end = min(video_time_offset + end_t + HIGHLIGHT_END_PAD_SEC,
+                                     video_duration_sec)
+                    active_segments.append((current_segment_start, padded_end))
+                telemetry_provider.update_state(new_state)
+
+            current_state = telemetry_provider.current_state
+
+            if current_state == "ACTIVE":
+                frame_in_point += 1
+                _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point)
+
+            if not headless:
+                render_frame(frame, telemetry, current_state, engine,
+                             telemetry_provider.exclusion_zones,
+                             telemetry_provider.active_zone_polygon)
+                debug_panel = render_debug_panel(current_state, engine, telemetry_provider)
+                cv2.imshow("Anya Pipeline", frame)
+                cv2.imshow("Debug Panel", debug_panel)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[INTERRUPTED] Ctrl-C detected — creating highlights from completed segments...")
+
+    finally:
+        if telemetry_provider.current_state == "ACTIVE":
+            padded_end = min(video_time_offset + last_telemetry_ts + HIGHLIGHT_END_PAD_SEC,
+                             video_duration_sec)
+            active_segments.append((current_segment_start, padded_end))
+
+        cap.release()
+        csv_file.close()
+        if not headless:
+            cv2.destroyAllWindows()
+
+    print(f"[COLLECT] {os.path.basename(video_path)}: {point_number} points, "
+          f"{len(active_segments)} segments")
+    if interrupted:
+        print("[COLLECT] (pipeline interrupted — segments cover completed detections only)")
+
+    return active_segments, point_number, csv_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-video pipeline (unchanged public behaviour)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_anya_pipeline(video_path, output_path=None, headless=False, start_frame=0):
+    # ── Default output path ───────────────────────────────────────────────
+    if output_path is None:
+        video_dir  = os.path.dirname(os.path.abspath(video_path))
+        video_stem = os.path.splitext(os.path.basename(video_path))[0]
+        output_path = os.path.join(video_dir, f"{video_stem}_highlights.mp4")
+
+    csv_path = os.path.splitext(output_path)[0] + "_telemetry.csv"
+
+    active_segments, point_number, _ = _collect_segments(
+        video_path, headless, start_frame, csv_path=csv_path
+    )
+
+    create_highlights_ffmpeg(video_path, active_segments, output_path)
 
     print(f"\n[DONE] Output video  : {output_path}")
     print(f"[DONE] Telemetry CSV : {csv_path}")
     print(f"[DONE] Points recorded: {point_number}")
 
 
-# ── CSV helper ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Serve-run helpers for dual-camera mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _group_segments_into_runs(segments, gap_threshold_sec=GAP_THRESHOLD_SEC):
+    """
+    Group temporally adjacent segments into runs.
+
+    Two consecutive segments belong to the same run when the gap between the
+    end of one and the start of the next is ≤ gap_threshold_sec.
+
+    Returns a list of runs, each run being a list of (start_sec, end_sec) tuples.
+    """
+    if not segments:
+        return []
+    runs         = []
+    current_run  = [segments[0]]
+    for seg in segments[1:]:
+        gap = seg[0] - current_run[-1][1]
+        if gap <= gap_threshold_sec:
+            current_run.append(seg)
+        else:
+            runs.append(current_run)
+            current_run = [seg]
+    runs.append(current_run)
+    return runs
+
+
+def _filter_by_serve_run(segments, video_label, min_run=MIN_SERVES_PER_RUN,
+                          gap_threshold_sec=GAP_THRESHOLD_SEC):
+    """
+    Keep only segments that belong to runs of >= min_run consecutive serves.
+
+    Tennis serves are taken from the same side for at least min_run serves
+    before the players rotate ends/cameras.  Runs shorter than this threshold
+    are likely false-positive detections or incomplete recordings and should be
+    discarded.
+
+    # TODO: End-of-set tiebreakers rotate serve every 2 points rather than
+    #       holding serve for a full game.  The current >=8-serve-per-run filter
+    #       and fixed gap threshold do not handle tiebreaker sequences correctly.
+    #       Implement tiebreaker detection (e.g. score-aware or pattern-based)
+    #       and apply a separate splicing logic for tiebreak segments.
+
+    Parameters
+    ----------
+    segments          : list of (start_sec, end_sec)
+    video_label       : human-readable label for log output (e.g. "Video A")
+    min_run           : minimum number of serves required to keep a run
+    gap_threshold_sec : maximum gap (seconds) allowed between serves in a run
+
+    Returns filtered list of (start_sec, end_sec).
+    """
+    runs           = _group_segments_into_runs(segments, gap_threshold_sec)
+    valid_segments = []
+    for i, run in enumerate(runs):
+        if len(run) >= min_run:
+            valid_segments.extend(run)
+            print(f"[DUAL] {video_label}: run {i+1} — {len(run)} serves  (VALID)")
+        else:
+            print(f"[DUAL] {video_label}: run {i+1} — {len(run)} serves  "
+                  f"(DISCARDED, fewer than {min_run} required)")
+    return valid_segments
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dual-camera pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_anya_pipeline_dual(video_a, video_b, time_offset_sec=0.0,
+                            output_path=None, headless=False, start_frame_a=0):
+    """
+    Run the Anya pipeline on two camera angles and produce a spliced highlight reel.
+
+    Each video is processed independently.  Active segments from each video are
+    grouped into serve runs and any run shorter than MIN_SERVES_PER_RUN is
+    discarded.  Surviving segments are merged in chronological wall-clock order
+    (using time_offset_sec to align the two timelines) and cut from the
+    appropriate source file.
+
+    Parameters
+    ----------
+    video_a          : Path to video from camera A (the reference timeline).
+    video_b          : Path to video from camera B.
+    time_offset_sec  : (video_A recording start) − (video_B recording start) in
+                       seconds.  Positive means video_A started *after* video_B.
+                       Used only for chronological sorting of the merged segments;
+                       each source file is still cut at its own local timestamps.
+    output_path      : Output highlight MP4 (default: <video_a_dir>/<stem>_dual_highlights.mp4).
+    headless         : Run without display windows.
+    start_frame_a    : Start processing video_A from this frame; video_B always
+                       starts at frame 0.
+
+    # TODO: End-of-set tiebreakers rotate serve every 2 points rather than
+    #       holding serve for a full game.  The current >=8-serve-per-run filter
+    #       may incorrectly discard tiebreak segments or fail to isolate them
+    #       from surrounding regular-play runs.  Implement tiebreaker detection
+    #       and apply separate splicing logic for those sequences.
+    """
+    if output_path is None:
+        video_dir  = os.path.dirname(os.path.abspath(video_a))
+        video_stem = os.path.splitext(os.path.basename(video_a))[0]
+        output_path = os.path.join(video_dir, f"{video_stem}_dual_highlights.mp4")
+
+    print(f"\n{'='*60}")
+    print(f"  DUAL PIPELINE")
+    print(f"  Video A : {os.path.basename(video_a)}")
+    print(f"  Video B : {os.path.basename(video_b)}")
+    print(f"  Offset  : {time_offset_sec:+.2f}s  (A start − B start)")
+    print(f"{'='*60}\n")
+
+    # ── Process each video independently ─────────────────────────────────
+    print(f"[DUAL] Processing Video A: {os.path.basename(video_a)}")
+    segs_a, points_a, csv_a = _collect_segments(video_a, headless, start_frame_a)
+
+    print(f"\n[DUAL] Processing Video B: {os.path.basename(video_b)}")
+    segs_b, points_b, csv_b = _collect_segments(video_b, headless, start_frame=0)
+
+    # ── Filter by serve-run length ────────────────────────────────────────
+    print(f"\n[DUAL] Filtering serve runs (min {MIN_SERVES_PER_RUN} serves per run, "
+          f"gap ≤ {GAP_THRESHOLD_SEC:.0f}s) …")
+    valid_segs_a = _filter_by_serve_run(segs_a, "Video A")
+    valid_segs_b = _filter_by_serve_run(segs_b, "Video B")
+
+    # ── Tag with wall-clock time for chronological merge ──────────────────
+    # Wall-clock reference: video_B start = 0.
+    # video_A wall time   = local_timestamp + time_offset_sec
+    # video_B wall time   = local_timestamp + 0
+    tagged_a = [(video_a, s, e, s + time_offset_sec) for s, e in valid_segs_a]
+    tagged_b = [(video_b, s, e, s)                   for s, e in valid_segs_b]
+
+    all_tagged = sorted(tagged_a + tagged_b, key=lambda x: x[3])
+
+    if not all_tagged:
+        print("\n[DUAL] No valid segments remain after filtering — no output produced.")
+        return
+
+    # ── Strip wall-clock field → (source_path, start_sec, end_sec) ───────
+    merged = [(src, s, e) for src, s, e, _ in all_tagged]
+
+    create_highlights_ffmpeg_multisource(merged, output_path)
+
+    print(f"\n[DONE] Output video   : {output_path}")
+    print(f"[DONE] Video A CSV    : {csv_a}")
+    print(f"[DONE] Video B CSV    : {csv_b}")
+    print(f"[DONE] Video A points : {points_a}  ({len(valid_segs_a)} valid segments)")
+    print(f"[DONE] Video B points : {points_b}  ({len(valid_segs_b)} valid segments)")
+    print(f"[DONE] Total segments in output: {len(merged)}")
+
+
+# ── CSV helper ─────────────────────────────────────────────────────────────────
 
 def _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point):
     """Write pure telemetry state and active transition data."""
     debug = engine.last_active_debug
-    
+
     csv_writer.writerow({
         "point":            point_number,
         "frame":            frame_in_point,
@@ -151,7 +376,7 @@ def _write_csv_row(csv_writer, engine, telemetry, point_number, frame_in_point):
     })
 
 
-# ── Debug visualisation ────────────────────────────────────────────────────
+# ── Debug visualisation ────────────────────────────────────────────────────────
 
 def render_frame(frame, telemetry, state, engine=None, exclusion_zones=None,
                  active_zone_polygon=None):
@@ -328,27 +553,64 @@ def render_armed_debug(panel, engine):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Anya Tennis Point Detection Pipeline"
+        description="Anya Tennis Point Detection Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Single camera:
+    python -m src.ai.run_anya video.mp4
+    python -m src.ai.run_anya video.mp4 --output out.mp4 --headless
+
+  Dual camera:
+    python -m src.ai.run_anya cam_a.mp4 cam_b.mp4 --time-offset 12.5
+    python -m src.ai.run_anya cam_a.mp4 cam_b.mp4 --time-offset -5 --output spliced.mp4 --headless
+""",
     )
     parser.add_argument(
         "input",
-        help="Path to input video file",
+        nargs="+",
+        metavar="VIDEO",
+        help="Path to input video file(s). Provide one video for single-camera mode, "
+             "or two videos (video_A video_B) for dual-camera mode.",
     )
     parser.add_argument(
         "--output",
-        default="output.mp4",
-        help="Path to output MP4 file (default: output.mp4)",
+        default=None,
+        help="Path to output MP4 file (default: derived from first input video name).",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run without displaying video windows",
+        help="Run without displaying video windows.",
     )
     parser.add_argument(
         "--start-frame",
         type=int,
         default=0,
-        help="Start processing from this frame number (default: 0)",
+        help="[Single/Dual mode] Start processing from this frame number in video_A (default: 0).",
+    )
+    parser.add_argument(
+        "--time-offset",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "[Dual mode only] Time offset in seconds: (video_A recording start) minus "
+            "(video_B recording start).  Positive = video_A started after video_B.  "
+            "Used for chronological sorting of the merged segment list (default: 0.0)."
+        ),
     )
     args = parser.parse_args()
-    run_anya_pipeline(args.input, args.output, args.headless, args.start_frame)
+
+    if len(args.input) == 1:
+        run_anya_pipeline(args.input[0], args.output, args.headless, args.start_frame)
+    elif len(args.input) == 2:
+        run_anya_pipeline_dual(
+            args.input[0], args.input[1],
+            time_offset_sec=args.time_offset,
+            output_path=args.output,
+            headless=args.headless,
+            start_frame_a=args.start_frame,
+        )
+    else:
+        parser.error("Provide 1 or 2 input videos.")
