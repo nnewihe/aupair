@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-native",
+    "paths": {
+      "@pair/types": ["../../packages/types/src/index.ts"],
+      "@pair/wizard-engine": ["../../packages/wizard-engine/src/index.ts"],
+      "@pair/question-definitions": ["../../packages/question-definitions/src/index.ts"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx", ".expo/types/**/*.ts", "expo-env.d.ts"]
+}

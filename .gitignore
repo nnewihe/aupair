@@ -1,0 +1,12 @@
+node_modules
+.turbo
+dist
+.expo
+*.local
+.env
+.env.*
+!.env.example
+supabase/.branches
+supabase/.temp
+.vercel
+.env*.local

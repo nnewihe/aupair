@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "paths": {
+      "@pair/types": ["../../packages/types/src/index.ts"],
+      "@pair/question-definitions": ["../../packages/question-definitions/src/index.ts"],
+      "@pair/wizard-engine": ["../../packages/wizard-engine/src/index.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts"]
+}
