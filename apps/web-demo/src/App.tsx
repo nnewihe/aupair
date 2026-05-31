@@ -588,6 +588,72 @@ function TextareaAndDateRangeListInput({ value, onChange }: {
   );
 }
 
+// ── StarterBullets ────────────────────────────────────────────────────────────
+function StarterBullets({
+  bullets,
+  currentValue,
+  onSelect,
+}: {
+  bullets: string[];
+  currentValue: string;
+  onSelect: (v: unknown) => void;
+}) {
+  const [expanded, setExpanded] = React.useState(false);
+
+  function append(bullet: string) {
+    const prefix = currentValue.trim();
+    onSelect(prefix ? `${prefix}\n\n${bullet}` : bullet);
+  }
+
+  return (
+    <div style={{
+      marginBottom: 14,
+      background: C.tealLight,
+      border: `1px solid ${C.tealBorder}`,
+      borderRadius: 10,
+      overflow: 'hidden',
+    }}>
+      <button
+        onClick={() => setExpanded(e => !e)}
+        style={{
+          width: '100%', padding: '10px 14px',
+          background: 'transparent', border: 'none',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          cursor: 'pointer', gap: 8,
+        }}
+      >
+        <span style={{ fontSize: 13, fontWeight: 600, color: C.tealDark }}>
+          💡 Need inspiration? See starter prompts
+        </span>
+        <span style={{ fontSize: 12, color: C.tealDark, flexShrink: 0 }}>
+          {expanded ? '▲' : '▼'}
+        </span>
+      </button>
+      {expanded && (
+        <div style={{ padding: '0 14px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <p style={{ fontSize: 12, color: C.subtle, margin: '0 0 8px' }}>
+            Click any prompt to add it as a starting point. Edit freely — these are just to get you going.
+          </p>
+          {bullets.map((bullet, i) => (
+            <button
+              key={i}
+              onClick={() => append(bullet)}
+              style={{
+                textAlign: 'left', padding: '8px 12px', borderRadius: 8,
+                border: `1px solid ${C.tealBorder}`, background: C.card,
+                fontSize: 13, color: C.text, cursor: 'pointer', lineHeight: 1.5,
+                transition: 'background .1s',
+              }}
+            >
+              {bullet}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── QuestionBlock ─────────────────────────────────────────────────────────────
 interface QuestionBlockProps {
   question: Question;
@@ -648,8 +714,11 @@ function QuestionBlock({
         return <TextListInput value={(val as string[]) ?? []} onChange={onVal as (v: string[]) => void} />;
       case 'date-range-list':
         return <DateRangeListInput value={(val as DateRange[]) ?? []} onChange={onVal as (v: DateRange[]) => void} />;
-      case 'textarea-and-date-range-list':
-        return <TextareaAndDateRangeListInput value={(val as TextAndDateRanges) ?? { text: '', ranges: [] }} onChange={onVal as (v: TextAndDateRanges) => void} />;
+      case 'textarea-and-date-range-list': {
+        const raw = val as TextAndDateRanges | null | undefined;
+        const safeVal: TextAndDateRanges = { text: raw?.text ?? '', ranges: raw?.ranges ?? [] };
+        return <TextareaAndDateRangeListInput value={safeVal} onChange={onVal as (v: TextAndDateRanges) => void} />;
+      }
       default:
         return null;
     }
@@ -674,6 +743,14 @@ function QuestionBlock({
         <p style={{ fontSize: 13, color: C.subtle, marginBottom: 14, marginTop: 2 }}>{question.subtext}</p>
       )}
       {!question.subtext && <div style={{ marginBottom: 14 }} />}
+
+      {question.starterBullets && question.starterBullets.length > 0 && (
+        <StarterBullets
+          bullets={question.starterBullets}
+          currentValue={(answer as string) ?? ''}
+          onSelect={onAnswer}
+        />
+      )}
 
       {renderInput(question, answer, onAnswer, freeTextValues, onFreeTextChange)}
 
@@ -1312,7 +1389,7 @@ function LandingPage({ onGetStarted }: { onGetStarted: () => void }) {
         <p style={{
           fontSize: 16, color: '#94a3b8', maxWidth: 520, margin: '0 auto 36px', lineHeight: 1.7,
         }}>
-          A personalised household guide takes about 15 minutes to complete and gives your au pair everything she needs to feel confident and at home from day one.
+          A personalised household guide takes about 15 minutes to complete and gives your au pair everything they need to feel confident and at home from day one.
         </p>
         <button
           onClick={onGetStarted}

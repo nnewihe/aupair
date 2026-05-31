@@ -25,6 +25,7 @@ export interface Question {
   optional?: boolean;
   placeholder?: string;
   followUp?: FollowUpQuestion;
+  starterBullets?: string[];
 }
 
 export interface ChildInfo {
@@ -233,7 +234,7 @@ export const SECTIONS: Section[] = [
           { value: "Cultural exchange and broadening our children's worldview" },
           { value: 'Flexibility around our work schedules' },
           { value: 'Support with the daily household routine' },
-          { value: 'A genuine member of the family during her time with us' },
+          { value: 'A genuine member of the family during their time with us' },
         ],
       },
       {
@@ -253,7 +254,7 @@ export const SECTIONS: Section[] = [
         text: "Is there anything you'd like the au pair to know about your family upfront?",
         inputType: 'textarea',
         optional: true,
-        placeholder: 'Anything that would help her feel welcome and prepared from day one...',
+        placeholder: 'Anything that would help them feel welcome and prepared from day one...',
       },
     ],
   },
@@ -330,13 +331,17 @@ export const SECTIONS: Section[] = [
       },
       {
         id: 'unsupervised_time',
-        text: 'How much unsupervised time with the children is typically expected?',
-        inputType: 'single-select',
+        text: 'When is the au pair typically alone with the children?',
+        subtext: 'Select all that apply',
+        inputType: 'multi-select',
         options: [
-          { value: 'Rarely — one or both parents are usually at home' },
-          { value: 'Several hours most weekdays' },
-          { value: 'Full days regularly' },
-          { value: 'Variable — depends on the week' },
+          { value: 'Weekday mornings' },
+          { value: 'Weekday afternoons / after school' },
+          { value: 'Full weekdays (both parents working)' },
+          { value: 'Weekend days' },
+          { value: 'Evening cover while parents are out' },
+          { value: 'Overnight when parents travel' },
+          { value: 'Rarely — one or both parents are usually home' },
         ],
       },
     ],
@@ -458,7 +463,7 @@ export const SECTIONS: Section[] = [
         inputType: 'single-select',
         options: [
           { value: 'We provide a phone and a plan' },
-          { value: 'We provide a plan only — au pair expected to use her own phone' },
+          { value: 'We provide a plan only — au pair expected to use their own phone' },
         ],
       },
       {
@@ -495,6 +500,17 @@ export const SECTIONS: Section[] = [
           inputType: 'text',
           placeholder: 'e.g. Three additional personal days, taken with two weeks notice',
         },
+      },
+      {
+        id: 'vacation_blocks',
+        text: 'How can the 2-week vacation entitlement be taken?',
+        subtext: 'The 2-week paid vacation entitlement is a legal requirement and cannot be reduced.',
+        inputType: 'single-select',
+        options: [
+          { value: 'As a single continuous 2-week block' },
+          { value: 'As two separate 1-week blocks' },
+          { value: 'Flexible — to be agreed between us' },
+        ],
       },
       {
         id: 'vacation_together',
@@ -558,15 +574,25 @@ export const SECTIONS: Section[] = [
         ],
       },
       {
-        id: 'screen_time_policy',
-        text: 'Screen time',
+        id: 'screen_time_weekdays',
+        text: 'Screen time — weekdays',
+        subtext: 'How much screen time per day on weekdays?',
         inputType: 'single-select',
         options: [
-          { value: 'No screens on weekdays' },
-          { value: 'Up to 30 minutes on weekdays' },
-          { value: 'Up to 1 hour on weekdays' },
-          { value: "Flexible by day — we'll discuss" },
-          { value: "Screen time is the family's call and not the au pair's to manage" },
+          { value: 'No screens' },
+          { value: 'Up to 30–60 minutes per day' },
+          { value: 'Flexible depending on the day' },
+        ],
+      },
+      {
+        id: 'screen_time_weekends',
+        text: 'Screen time — weekends',
+        subtext: 'How much screen time per day on weekends?',
+        inputType: 'single-select',
+        options: [
+          { value: 'No screens' },
+          { value: 'Up to 30–60 minutes per day' },
+          { value: 'Flexible depending on the day' },
         ],
       },
       {
@@ -575,6 +601,15 @@ export const SECTIONS: Section[] = [
         subtext: 'This is the most important question in this section. Your answer becomes the foundation for the au pair\'s performance criteria. Be specific.',
         inputType: 'textarea',
         placeholder: 'Describe what outstanding care looks like in your home...',
+        starterBullets: [
+          'You notice what a child needs before they ask — and act on it without being prompted.',
+          'You get down to their level: on the floor, in the game, fully present — not watching from the side.',
+          'You bring your own ideas for activities and don\'t wait to be told what to do with the children.',
+          'You communicate proactively — a quick message when something goes well, or if something\'s off.',
+          'You follow our routines consistently, even when it\'s easier not to (bedtime, screen limits, food rules).',
+          'The children feel genuinely safe and happy with you — not just supervised.',
+          'You treat this home as your own and the children as people worth investing in, not just a job.',
+        ],
       },
       {
         id: 'cultural_values',
