@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import HoursModule from './HoursModule';
 import { useWizardStore, getFamilyName } from './store';
 import type { SectionState } from './store';
 import {
@@ -11,6 +12,9 @@ import {
 import type { Section, Question, QuestionOption, ChildInfo, DateRange, TextAndDateRanges, ToneOption } from './engine/sections';
 import { generateSectionSummary } from './api/claude';
 import { generateGuideHtml } from './guide';
+
+// ── Layout constants ───────────────────────────────────────────────────────────
+const NAV_H = 48; // height of the top nav bar
 
 // ── Colour tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -1367,6 +1371,47 @@ function SectionView({
   );
 }
 
+// ── NavBar ────────────────────────────────────────────────────────────────────
+type AppModule = 'guide' | 'hours';
+
+function NavBar({ active, onSwitch }: { active: AppModule; onSwitch: (m: AppModule) => void }) {
+  return (
+    <nav style={{
+      position: 'fixed', top: 0, left: 0, right: 0,
+      height: NAV_H, background: C.navy,
+      display: 'flex', alignItems: 'center',
+      padding: '0 20px', gap: 4, zIndex: 40,
+      borderBottom: '1px solid rgba(255,255,255,.1)',
+    }}>
+      <span style={{
+        fontWeight: 800, fontSize: 20, color: '#fff',
+        letterSpacing: '-0.5px', marginRight: 'auto',
+      }}>
+        pair
+      </span>
+      {(['guide', 'hours'] as const).map(m => {
+        const labels: Record<AppModule, string> = { guide: 'Household Guide', hours: 'Hours Tracker' };
+        const isActive = m === active;
+        return (
+          <button
+            key={m}
+            onClick={() => onSwitch(m)}
+            style={{
+              padding: '6px 14px', borderRadius: 8, border: 'none',
+              background: isActive ? 'rgba(255,255,255,.15)' : 'transparent',
+              color: isActive ? '#fff' : 'rgba(255,255,255,.55)',
+              fontWeight: isActive ? 700 : 500, fontSize: 14,
+              cursor: 'pointer', transition: 'all .12s',
+            }}
+          >
+            {labels[m]}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 // ── LandingPage ───────────────────────────────────────────────────────────────
 function LandingPage({ onGetStarted }: { onGetStarted: () => void }) {
   return (
@@ -1377,9 +1422,6 @@ function LandingPage({ onGetStarted }: { onGetStarted: () => void }) {
         padding: '64px 24px 56px',
         textAlign: 'center',
       }}>
-        <div style={{ fontSize: 32, fontWeight: 800, color: '#fff', letterSpacing: '-1px', marginBottom: 20 }}>
-          pair
-        </div>
         <h1 style={{
           fontSize: 36, fontWeight: 800, color: '#fff', letterSpacing: '-1px',
           marginBottom: 16, maxWidth: 560, margin: '0 auto 16px',
@@ -1580,14 +1622,14 @@ function MainWizard() {
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg }}>
-      {/* Fixed header */}
+      {/* Fixed header (sits below the NavBar) */}
       <header style={{
         background: '#fff', borderBottom: `1px solid ${C.border}`,
         padding: '0 24px',
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        height: 60, position: 'fixed', top: 0, left: 0, right: 0, zIndex: 20,
+        height: 60, position: 'fixed', top: NAV_H, left: 0, right: 0, zIndex: 20,
       }}>
-        <span style={{ fontWeight: 800, fontSize: 22, color: C.navy, letterSpacing: '-0.5px' }}>pair</span>
+        <span style={{ fontWeight: 700, fontSize: 15, color: C.subtle }}>Household Guide</span>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           <button
             onClick={handleGenerateDraft}
@@ -1618,12 +1660,12 @@ function MainWizard() {
         </div>
       </header>
 
-      {/* Body below fixed header */}
-      <div style={{ display: 'flex', minHeight: '100vh', paddingTop: 60 }}>
+      {/* Body below nav + wizard header */}
+      <div style={{ display: 'flex', minHeight: '100vh', paddingTop: NAV_H + 60 }}>
         {/* Sidebar */}
         <aside style={{
           width: 220, flexShrink: 0, background: C.card, borderRight: `1px solid ${C.border}`,
-          padding: '20px 0', position: 'fixed', top: 60, bottom: 0,
+          padding: '20px 0', position: 'fixed', top: NAV_H + 60, bottom: 0,
           overflowY: 'auto', zIndex: 10,
         }}>
           {SECTIONS.map((sec, i) => {
@@ -1731,20 +1773,31 @@ export default function App() {
   const store = useWizardStore();
   const { state } = store;
   const [showToneSelector, setShowToneSelector] = useState(false);
+  const [activeModule, setActiveModule] = useState<AppModule>('guide');
 
-  if (state.tone === null) {
-    if (showToneSelector) {
-      return (
-        <ToneSelector
-          onSelect={tone => {
-            store.setTone(tone);
-            setShowToneSelector(false);
-          }}
-        />
-      );
+  function renderGuide() {
+    if (state.tone === null) {
+      if (showToneSelector) {
+        return (
+          <ToneSelector
+            onSelect={tone => {
+              store.setTone(tone);
+              setShowToneSelector(false);
+            }}
+          />
+        );
+      }
+      return <LandingPage onGetStarted={() => setShowToneSelector(true)} />;
     }
-    return <LandingPage onGetStarted={() => setShowToneSelector(true)} />;
+    return <MainWizard />;
   }
 
-  return <MainWizard />;
+  return (
+    <>
+      <NavBar active={activeModule} onSwitch={setActiveModule} />
+      <div style={{ paddingTop: NAV_H }}>
+        {activeModule === 'hours' ? <HoursModule /> : renderGuide()}
+      </div>
+    </>
+  );
 }

@@ -10,3 +10,18 @@ supabase/.branches
 supabase/.temp
 .vercel
 .env*.local
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Word lock files
+~$*.docx
+
+# Local agent tooling
+.claire/
+.claude/settings.local.json
+.claude/worktrees
